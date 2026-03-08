@@ -1,22 +1,69 @@
-import streamlit as st
+"""InsightForge BI Assistant — Streamlit dashboard with RAG-powered AI chat.
+
+A multi-view analytics dashboard backed by a local Ollama LLM and a
+FAISS vector store.  Views include Sales Overview, Product Analysis,
+Regional Analysis, Customer Demographics, Advanced Analytics, and an
+AI Assistant that answers natural-language questions about the dataset.
+
+Requirements:
+    - Ollama running locally with ``llama3.2:3b`` and ``nomic-embed-text``
+    - ``sales_data.csv`` in the working directory
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
-COLORS = ["#6366f1", "#22d3ee", "#f59e0b", "#ef4444", "#10b981", "#8b5cf6"]
-PRODUCT_COLORS = {"Widget A": "#6366f1", "Widget B": "#22d3ee", "Widget C": "#f59e0b", "Widget D": "#ef4444"}
-REGION_COLORS = {"North": "#6366f1", "South": "#22d3ee", "East": "#f59e0b", "West": "#ef4444"}
+logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="InsightForge BI Assistant", page_icon="📊", layout="wide")
+# ---------------------------------------------------------------------------
+# Configuration — centralised knobs so nothing is buried in function bodies
+# ---------------------------------------------------------------------------
 
-st.markdown("""
+DATA_PATH: Path = Path("sales_data.csv")
+
+LLM_MODEL: str = "llama3.2:3b"
+EMBEDDING_MODEL: str = "nomic-embed-text"
+LLM_TEMPERATURE: float = 0
+RAG_TOP_K: int = 5
+
+CHART_TEMPLATE: str = "plotly_dark"
+
+COLORS: list[str] = [
+    "#6366f1", "#22d3ee", "#f59e0b", "#ef4444", "#10b981", "#8b5cf6",
+]
+PRODUCT_COLORS: dict[str, str] = {
+    "Widget A": "#6366f1",
+    "Widget B": "#22d3ee",
+    "Widget C": "#f59e0b",
+    "Widget D": "#ef4444",
+}
+REGION_COLORS: dict[str, str] = {
+    "North": "#6366f1",
+    "South": "#22d3ee",
+    "East": "#f59e0b",
+    "West": "#ef4444",
+}
+
+APP_VERSION: str = "2.0"
+
+# ---------------------------------------------------------------------------
+# Page config & custom CSS
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="InsightForge BI Assistant", page_icon="📊", layout="wide",
+)
+
+st.markdown(
+    """
 <style>
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #1e1b4b 0%, #312e81 100%); }
     [data-testid="stSidebar"] * { color: #e0e7ff !important; }
@@ -33,12 +80,38 @@ st.markdown("""
     .section-header { border-left: 4px solid #6366f1; padding-left: 12px; margin: 1.5rem 0 1rem 0; }
     div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 
 @st.cache_data
-def load_data():
-    df = pd.read_csv("sales_data.csv")
+def load_data() -> pd.DataFrame:
+    """Read *sales_data.csv* and enrich with derived time / demographic columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with original columns plus ``Month``, ``Quarter``, ``Year``,
+        ``DayOfWeek``, ``Age_Group``, and ``Satisfaction_Level``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``DATA_PATH`` does not point to an existing file.
+    """
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(
+            f"Data file not found at '{DATA_PATH.resolve()}'. "
+            "Ensure sales_data.csv is in the working directory."
+        )
+
+    df = pd.read_csv(DATA_PATH)
     df["Date"] = pd.to_datetime(df["Date"])
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
     df["Quarter"] = df["Date"].dt.to_period("Q").astype(str)
@@ -57,87 +130,144 @@ def load_data():
     return df
 
 
-@st.cache_resource
-def initialize_rag_system(_df):
-    llm = ChatOllama(model="llama3.2:3b", temperature=0)
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+# ---------------------------------------------------------------------------
+# RAG system
+# ---------------------------------------------------------------------------
 
-    documents = []
+
+@st.cache_resource
+def initialize_rag_system(_df: pd.DataFrame):
+    """Build a FAISS-backed RAG pipeline over aggregated sales statistics.
+
+    Creates LangChain ``Document`` objects covering dataset overview, per-product,
+    per-region, cross-segment, gender, and monthly trend summaries, then indexes
+    them in a FAISS vector store using Ollama embeddings.
+
+    Parameters
+    ----------
+    _df : pd.DataFrame
+        The full (unfiltered) sales DataFrame.  The leading underscore tells
+        Streamlit not to hash this argument.
+
+    Returns
+    -------
+    tuple[ChatOllama, FAISS]
+        The LLM instance and the populated vector store.
+    """
+    from langchain_community.vectorstores import FAISS
+    from langchain_core.documents import Document
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+
+    llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+
+    documents: list[Document] = []
     total_sales = _df["Sales"].sum()
+
+    # -- Dataset-wide overview
     documents.append(Document(
         page_content=(
-            f"Dataset Overview: {len(_df)} transactions from {_df['Date'].min().date()} to {_df['Date'].max().date()}. "
-            f"Total Sales: ${total_sales:,.2f}. Average Transaction: ${_df['Sales'].mean():.2f}. "
+            f"Dataset Overview: {len(_df)} transactions from "
+            f"{_df['Date'].min().date()} to {_df['Date'].max().date()}. "
+            f"Total Sales: ${total_sales:,.2f}. "
+            f"Average Transaction: ${_df['Sales'].mean():.2f}. "
             f"Median Transaction: ${_df['Sales'].median():.2f}. "
-            f"Products: {', '.join(_df['Product'].unique())}. Regions: {', '.join(_df['Region'].unique())}. "
-            f"Customer Age Range: {_df['Customer_Age'].min()}-{_df['Customer_Age'].max()} (avg {_df['Customer_Age'].mean():.1f}). "
+            f"Products: {', '.join(_df['Product'].unique())}. "
+            f"Regions: {', '.join(_df['Region'].unique())}. "
+            f"Customer Age Range: {_df['Customer_Age'].min()}"
+            f"-{_df['Customer_Age'].max()} "
+            f"(avg {_df['Customer_Age'].mean():.1f}). "
             f"Gender Split: {dict(_df['Customer_Gender'].value_counts())}. "
-            f"Overall Satisfaction: {_df['Customer_Satisfaction'].mean():.2f}/5."
+            f"Overall Satisfaction: "
+            f"{_df['Customer_Satisfaction'].mean():.2f}/5."
         ),
         metadata={"type": "overview"},
     ))
 
+    # -- Per-product summaries
     for product in _df["Product"].unique():
         pdf = _df[_df["Product"] == product]
         share = pdf["Sales"].sum() / total_sales * 100
         top_region = pdf.groupby("Region")["Sales"].sum().idxmax()
         documents.append(Document(
             page_content=(
-                f"Product {product}: Total ${pdf['Sales'].sum():,.2f} ({share:.1f}% share), "
-                f"Avg ${pdf['Sales'].mean():.2f}, Median ${pdf['Sales'].median():.2f}, "
-                f"{len(pdf)} transactions. Satisfaction {pdf['Customer_Satisfaction'].mean():.2f}/5. "
+                f"Product {product}: Total ${pdf['Sales'].sum():,.2f} "
+                f"({share:.1f}% share), Avg ${pdf['Sales'].mean():.2f}, "
+                f"Median ${pdf['Sales'].median():.2f}, {len(pdf)} transactions. "
+                f"Satisfaction {pdf['Customer_Satisfaction'].mean():.2f}/5. "
                 f"Top region: {top_region}. "
                 f"Avg customer age: {pdf['Customer_Age'].mean():.1f}."
             ),
             metadata={"type": "product"},
         ))
 
+    # -- Per-region summaries
     for region in _df["Region"].unique():
         rdf = _df[_df["Region"] == region]
         share = rdf["Sales"].sum() / total_sales * 100
         top_product = rdf.groupby("Product")["Sales"].sum().idxmax()
         documents.append(Document(
             page_content=(
-                f"Region {region}: Total ${rdf['Sales'].sum():,.2f} ({share:.1f}% share), "
-                f"Avg ${rdf['Sales'].mean():.2f}, {len(rdf)} transactions. "
+                f"Region {region}: Total ${rdf['Sales'].sum():,.2f} "
+                f"({share:.1f}% share), Avg ${rdf['Sales'].mean():.2f}, "
+                f"{len(rdf)} transactions. "
                 f"Satisfaction {rdf['Customer_Satisfaction'].mean():.2f}/5. "
-                f"Top product: {top_product}. Gender split: {dict(rdf['Customer_Gender'].value_counts())}."
+                f"Top product: {top_product}. "
+                f"Gender split: "
+                f"{dict(rdf['Customer_Gender'].value_counts())}."
             ),
             metadata={"type": "region"},
         ))
 
+    # -- Product × Region cross-segments
     for product in _df["Product"].unique():
         for region in _df["Region"].unique():
-            subset = _df[(_df["Product"] == product) & (_df["Region"] == region)]
+            subset = _df[
+                (_df["Product"] == product) & (_df["Region"] == region)
+            ]
             if len(subset) > 0:
                 documents.append(Document(
                     page_content=(
-                        f"{product} in {region}: ${subset['Sales'].sum():,.2f} total, "
-                        f"Avg ${subset['Sales'].mean():.2f}, {len(subset)} transactions, "
-                        f"Satisfaction {subset['Customer_Satisfaction'].mean():.2f}/5."
+                        f"{product} in {region}: "
+                        f"${subset['Sales'].sum():,.2f} total, "
+                        f"Avg ${subset['Sales'].mean():.2f}, "
+                        f"{len(subset)} transactions, "
+                        f"Satisfaction "
+                        f"{subset['Customer_Satisfaction'].mean():.2f}/5."
                     ),
                     metadata={"type": "cross"},
                 ))
 
+    # -- Gender summaries
     for gender in _df["Customer_Gender"].unique():
         gdf = _df[_df["Customer_Gender"] == gender]
         documents.append(Document(
             page_content=(
-                f"{gender} customers: {len(gdf)} transactions, Total ${gdf['Sales'].sum():,.2f}, "
-                f"Avg ${gdf['Sales'].mean():.2f}, Satisfaction {gdf['Customer_Satisfaction'].mean():.2f}/5, "
+                f"{gender} customers: {len(gdf)} transactions, "
+                f"Total ${gdf['Sales'].sum():,.2f}, "
+                f"Avg ${gdf['Sales'].mean():.2f}, "
+                f"Satisfaction "
+                f"{gdf['Customer_Satisfaction'].mean():.2f}/5, "
                 f"Avg age {gdf['Customer_Age'].mean():.1f}."
             ),
             metadata={"type": "gender"},
         ))
 
-    monthly = _df.groupby("Month").agg({"Sales": ["sum", "mean", "count"]}).reset_index()
+    # -- Monthly trend highlights
+    monthly = (
+        _df.groupby("Month")
+        .agg({"Sales": ["sum", "mean", "count"]})
+        .reset_index()
+    )
     monthly.columns = ["Month", "Total", "Avg", "Count"]
     best_month = monthly.loc[monthly["Total"].idxmax()]
     worst_month = monthly.loc[monthly["Total"].idxmin()]
     documents.append(Document(
         page_content=(
-            f"Monthly Trends: Best month {best_month['Month']} (${best_month['Total']:,.0f}), "
-            f"Worst month {worst_month['Month']} (${worst_month['Total']:,.0f}). "
+            f"Monthly Trends: Best month {best_month['Month']} "
+            f"(${best_month['Total']:,.0f}), "
+            f"Worst month {worst_month['Month']} "
+            f"(${worst_month['Total']:,.0f}). "
             f"Average monthly sales: ${monthly['Total'].mean():,.0f}."
         ),
         metadata={"type": "trend"},
@@ -147,14 +277,33 @@ def initialize_rag_system(_df):
     return llm, vectorstore
 
 
-def render_metric(label, value):
+# ---------------------------------------------------------------------------
+# Reusable UI helpers
+# ---------------------------------------------------------------------------
+
+
+def render_metric(label: str, value: str) -> None:
+    """Render a styled KPI metric card via raw HTML."""
     st.markdown(
         f'<div class="metric-card"><h3>{label}</h3><h1>{value}</h1></div>',
         unsafe_allow_html=True,
     )
 
 
-def apply_filters(df):
+def render_section_header(title: str) -> None:
+    """Render a view section header with the accent left-border style."""
+    st.markdown(
+        f'<div class="section-header"><h2>{title}</h2></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """Present sidebar filter widgets and return the filtered DataFrame.
+
+    Filters include date range, product, region, gender, and customer age.
+    A summary count is displayed below the filter expander.
+    """
     filtered = df.copy()
     with st.sidebar.expander("🔍 Filters", expanded=True):
         date_range = st.date_input(
@@ -169,15 +318,27 @@ def apply_filters(df):
                 & (filtered["Date"].dt.date <= date_range[1])
             ]
 
-        products = st.multiselect("Products", df["Product"].unique(), default=list(df["Product"].unique()))
+        products = st.multiselect(
+            "Products",
+            df["Product"].unique(),
+            default=list(df["Product"].unique()),
+        )
         if products:
             filtered = filtered[filtered["Product"].isin(products)]
 
-        regions = st.multiselect("Regions", df["Region"].unique(), default=list(df["Region"].unique()))
+        regions = st.multiselect(
+            "Regions",
+            df["Region"].unique(),
+            default=list(df["Region"].unique()),
+        )
         if regions:
             filtered = filtered[filtered["Region"].isin(regions)]
 
-        genders = st.multiselect("Gender", df["Customer_Gender"].unique(), default=list(df["Customer_Gender"].unique()))
+        genders = st.multiselect(
+            "Gender",
+            df["Customer_Gender"].unique(),
+            default=list(df["Customer_Gender"].unique()),
+        )
         if genders:
             filtered = filtered[filtered["Customer_Gender"].isin(genders)]
 
@@ -192,15 +353,25 @@ def apply_filters(df):
             & (filtered["Customer_Age"] <= age_range[1])
         ]
 
-    st.sidebar.markdown(f"**Showing {len(filtered):,} of {len(df):,} records**")
+    st.sidebar.markdown(
+        f"**Showing {len(filtered):,} of {len(df):,} records**"
+    )
     return filtered
 
 
-# ──────────────────────── MAIN ────────────────────────
+# ---------------------------------------------------------------------------
+# Main application entry point
+# ---------------------------------------------------------------------------
 
-df_raw = load_data()
+try:
+    df_raw = load_data()
+except (FileNotFoundError, pd.errors.EmptyDataError) as exc:
+    st.error(f"Failed to load data: {exc}")
+    st.stop()
 
-st.sidebar.image("https://img.icons8.com/fluency/48/combo-chart.png", width=40)
+st.sidebar.image(
+    "https://img.icons8.com/fluency/48/combo-chart.png", width=40,
+)
 st.sidebar.title("InsightForge")
 st.sidebar.markdown("---")
 
@@ -219,10 +390,7 @@ df = apply_filters(df_raw)
 # ──────────────────────── SALES OVERVIEW ────────────────────────
 
 if view == "📊 Sales Overview":
-    st.markdown(
-        '<div class="section-header"><h2>Sales Overview Dashboard</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Sales Overview Dashboard")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -234,11 +402,18 @@ if view == "📊 Sales Overview":
     with c4:
         render_metric("Median Sale", f"${df['Sales'].median():,.0f}")
     with c5:
-        render_metric("Avg Satisfaction", f"{df['Customer_Satisfaction'].mean():.2f}/5")
+        render_metric(
+            "Avg Satisfaction",
+            f"{df['Customer_Satisfaction'].mean():.2f}/5",
+        )
 
     st.markdown("")
 
-    monthly = df.groupby("Month").agg({"Sales": ["sum", "mean", "count"]}).reset_index()
+    monthly = (
+        df.groupby("Month")
+        .agg({"Sales": ["sum", "mean", "count"]})
+        .reset_index()
+    )
     monthly.columns = ["Month", "Total_Sales", "Avg_Sale", "Transactions"]
     monthly["Cumulative"] = monthly["Total_Sales"].cumsum()
     monthly["MA_3"] = monthly["Total_Sales"].rolling(3, min_periods=1).mean()
@@ -250,44 +425,65 @@ if view == "📊 Sales Overview":
         fig.add_trace(go.Scatter(
             x=monthly["Month"], y=monthly["Total_Sales"],
             mode="lines+markers", name="Monthly Sales",
-            line=dict(color="#6366f1", width=2), marker=dict(size=5),
+            line={"color": "#6366f1", "width": 2}, marker={"size": 5},
         ))
         fig.add_trace(go.Scatter(
             x=monthly["Month"], y=monthly["MA_3"],
             mode="lines", name="3-Month Moving Avg",
-            line=dict(color="#f59e0b", width=2, dash="dash"),
+            line={"color": "#f59e0b", "width": 2, "dash": "dash"},
         ))
         fig.update_layout(
-            template="plotly_dark", height=400,
+            template=CHART_TEMPLATE, height=400,
             xaxis_title="Month", yaxis_title="Sales ($)",
-            hovermode="x unified", xaxis=dict(tickangle=-45, dtick=3),
+            hovermode="x unified", xaxis={"tickangle": -45, "dtick": 3},
         )
         st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
-        fig = px.area(monthly, x="Month", y="Cumulative", color_discrete_sequence=["#6366f1"])
+        fig = px.area(
+            monthly, x="Month", y="Cumulative",
+            color_discrete_sequence=["#6366f1"],
+        )
         fig.update_layout(
-            template="plotly_dark", height=400,
+            template=CHART_TEMPLATE, height=400,
             xaxis_title="Month", yaxis_title="Cumulative Sales ($)",
-            xaxis=dict(tickangle=-45, dtick=3),
+            xaxis={"tickangle": -45, "dtick": 3},
         )
         st.plotly_chart(fig, use_container_width=True)
 
     col1, col2 = st.columns(2)
     with col1:
         quarterly = df.groupby("Quarter")["Sales"].sum().reset_index()
-        fig = px.bar(quarterly, x="Quarter", y="Sales", color_discrete_sequence=["#6366f1"], text_auto=",.0f")
-        fig.update_layout(template="plotly_dark", height=350, title="Quarterly Revenue", xaxis=dict(tickangle=-45))
+        fig = px.bar(
+            quarterly, x="Quarter", y="Sales",
+            color_discrete_sequence=["#6366f1"], text_auto=",.0f",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=350,
+            title="Quarterly Revenue", xaxis={"tickangle": -45},
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        dow = df.groupby("DayOfWeek")["Sales"].mean().reindex(dow_order).reset_index()
-        fig = px.bar(dow, x="DayOfWeek", y="Sales", color_discrete_sequence=["#22d3ee"], text_auto=",.0f")
+        dow_order = [
+            "Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday",
+        ]
+        dow = (
+            df.groupby("DayOfWeek")["Sales"]
+            .mean()
+            .reindex(dow_order)
+            .reset_index()
+        )
+        fig = px.bar(
+            dow, x="DayOfWeek", y="Sales",
+            color_discrete_sequence=["#22d3ee"], text_auto=",.0f",
+        )
         fig.update_layout(
-            template="plotly_dark", height=350,
-            title="Avg Sales by Day of Week", xaxis_title="", yaxis_title="Avg Sales ($)",
+            template=CHART_TEMPLATE, height=350,
+            title="Avg Sales by Day of Week",
+            xaxis_title="", yaxis_title="Avg Sales ($)",
         )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
@@ -295,30 +491,35 @@ if view == "📊 Sales Overview":
 # ──────────────────────── PRODUCT ANALYSIS ────────────────────────
 
 elif view == "📦 Product Analysis":
-    st.markdown(
-        '<div class="section-header"><h2>Product Performance Analysis</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Product Performance Analysis")
 
-    prod_agg = df.groupby("Product").agg(
-        Total_Sales=("Sales", "sum"),
-        Avg_Sale=("Sales", "mean"),
-        Transactions=("Sales", "count"),
-        Satisfaction=("Customer_Satisfaction", "mean"),
-    ).round(2).reset_index()
+    prod_agg = (
+        df.groupby("Product")
+        .agg(
+            Total_Sales=("Sales", "sum"),
+            Avg_Sale=("Sales", "mean"),
+            Transactions=("Sales", "count"),
+            Satisfaction=("Customer_Satisfaction", "mean"),
+        )
+        .round(2)
+        .reset_index()
+    )
 
     cols = st.columns(len(prod_agg))
     for i, row in prod_agg.iterrows():
         with cols[i % len(cols)]:
             color = PRODUCT_COLORS.get(row["Product"], COLORS[i % len(COLORS)])
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="metric-card" style="border-left: 4px solid {color};">
                 <h3>{row['Product']}</h3>
                 <h1>${row['Total_Sales']:,.0f}</h1>
                 <p style="color:#a5b4fc; font-size:0.8rem; margin:0;">
                     {row['Transactions']:.0f} txns · Avg ${row['Avg_Sale']:,.0f} · ⭐ {row['Satisfaction']:.2f}
                 </p>
-            </div>""", unsafe_allow_html=True)
+            </div>""",
+                unsafe_allow_html=True,
+            )
 
     st.markdown("")
     col1, col2 = st.columns(2)
@@ -326,9 +527,14 @@ elif view == "📦 Product Analysis":
     with col1:
         fig = px.bar(
             prod_agg, x="Product", y="Total_Sales",
-            color="Product", color_discrete_map=PRODUCT_COLORS, text_auto=",.0f",
+            color="Product", color_discrete_map=PRODUCT_COLORS,
+            text_auto=",.0f",
         )
-        fig.update_layout(template="plotly_dark", height=400, title="Total Sales by Product", showlegend=False, yaxis_title="Sales ($)")
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400,
+            title="Total Sales by Product", showlegend=False,
+            yaxis_title="Sales ($)",
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -337,69 +543,99 @@ elif view == "📦 Product Analysis":
             prod_agg, names="Product", values="Total_Sales",
             color="Product", color_discrete_map=PRODUCT_COLORS, hole=0.45,
         )
-        fig.update_layout(template="plotly_dark", height=400, title="Revenue Share by Product")
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400,
+            title="Revenue Share by Product",
+        )
         fig.update_traces(textinfo="percent+label", textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Product × Region Heatmap")
-    cross = df.pivot_table(values="Sales", index="Product", columns="Region", aggfunc="sum")
-    fig = px.imshow(cross, text_auto=",.0f", color_continuous_scale="Viridis", aspect="auto")
-    fig.update_layout(template="plotly_dark", height=350)
+    cross = df.pivot_table(
+        values="Sales", index="Product", columns="Region", aggfunc="sum",
+    )
+    fig = px.imshow(
+        cross, text_auto=",.0f", color_continuous_scale="Viridis",
+        aspect="auto",
+    )
+    fig.update_layout(template=CHART_TEMPLATE, height=350)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Monthly Sales by Product")
-    prod_monthly = df.groupby(["Month", "Product"])["Sales"].sum().reset_index()
-    fig = px.line(prod_monthly, x="Month", y="Sales", color="Product", color_discrete_map=PRODUCT_COLORS, markers=True)
-    fig.update_layout(template="plotly_dark", height=400, xaxis=dict(tickangle=-45, dtick=3), hovermode="x unified")
+    prod_monthly = (
+        df.groupby(["Month", "Product"])["Sales"].sum().reset_index()
+    )
+    fig = px.line(
+        prod_monthly, x="Month", y="Sales", color="Product",
+        color_discrete_map=PRODUCT_COLORS, markers=True,
+    )
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=400,
+        xaxis={"tickangle": -45, "dtick": 3}, hovermode="x unified",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Product Comparison Radar")
     radar_data = prod_agg.copy()
     for col in ["Total_Sales", "Avg_Sale", "Transactions", "Satisfaction"]:
         col_range = radar_data[col].max() - radar_data[col].min()
-        radar_data[col + "_norm"] = (radar_data[col] - radar_data[col].min()) / (col_range if col_range > 0 else 1)
+        radar_data[col + "_norm"] = (
+            (radar_data[col] - radar_data[col].min())
+            / (col_range if col_range > 0 else 1)
+        )
 
     fig = go.Figure()
     categories = ["Total Sales", "Avg Sale", "Transactions", "Satisfaction"]
     for _, row in radar_data.iterrows():
-        values = [row["Total_Sales_norm"], row["Avg_Sale_norm"], row["Transactions_norm"], row["Satisfaction_norm"]]
+        values = [
+            row["Total_Sales_norm"], row["Avg_Sale_norm"],
+            row["Transactions_norm"], row["Satisfaction_norm"],
+        ]
         fig.add_trace(go.Scatterpolar(
             r=values + [values[0]],
             theta=categories + [categories[0]],
             fill="toself",
             name=row["Product"],
-            line=dict(color=PRODUCT_COLORS.get(row["Product"])),
+            line={"color": PRODUCT_COLORS.get(row["Product"])},
         ))
-    fig.update_layout(template="plotly_dark", height=450, polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=450,
+        polar={"radialaxis": {"visible": True, "range": [0, 1]}},
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 # ──────────────────────── REGIONAL ANALYSIS ────────────────────────
 
 elif view == "🗺️ Regional Analysis":
-    st.markdown(
-        '<div class="section-header"><h2>Regional Performance Analysis</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Regional Performance Analysis")
 
-    reg_agg = df.groupby("Region").agg(
-        Total_Sales=("Sales", "sum"),
-        Avg_Sale=("Sales", "mean"),
-        Transactions=("Sales", "count"),
-        Satisfaction=("Customer_Satisfaction", "mean"),
-    ).round(2).reset_index()
+    reg_agg = (
+        df.groupby("Region")
+        .agg(
+            Total_Sales=("Sales", "sum"),
+            Avg_Sale=("Sales", "mean"),
+            Transactions=("Sales", "count"),
+            Satisfaction=("Customer_Satisfaction", "mean"),
+        )
+        .round(2)
+        .reset_index()
+    )
 
     cols = st.columns(len(reg_agg))
     for i, row in reg_agg.iterrows():
         with cols[i % len(cols)]:
             color = REGION_COLORS.get(row["Region"], COLORS[i % len(COLORS)])
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="metric-card" style="border-left: 4px solid {color};">
                 <h3>{row['Region']}</h3>
                 <h1>${row['Total_Sales']:,.0f}</h1>
                 <p style="color:#a5b4fc; font-size:0.8rem; margin:0;">
                     {row['Transactions']:.0f} txns · Avg ${row['Avg_Sale']:,.0f} · ⭐ {row['Satisfaction']:.2f}
                 </p>
-            </div>""", unsafe_allow_html=True)
+            </div>""",
+                unsafe_allow_html=True,
+            )
 
     st.markdown("")
     col1, col2 = st.columns(2)
@@ -408,202 +644,365 @@ elif view == "🗺️ Regional Analysis":
         fig = px.bar(
             reg_agg.sort_values("Total_Sales", ascending=True),
             x="Total_Sales", y="Region", orientation="h",
-            color="Region", color_discrete_map=REGION_COLORS, text_auto=",.0f",
+            color="Region", color_discrete_map=REGION_COLORS,
+            text_auto=",.0f",
         )
-        fig.update_layout(template="plotly_dark", height=350, title="Total Sales by Region", showlegend=False, xaxis_title="Sales ($)")
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=350,
+            title="Total Sales by Region", showlegend=False,
+            xaxis_title="Sales ($)",
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        fig = px.treemap(df, path=["Region", "Product"], values="Sales", color_discrete_sequence=COLORS)
-        fig.update_layout(template="plotly_dark", height=350, title="Sales Treemap: Region → Product")
+        fig = px.treemap(
+            df, path=["Region", "Product"], values="Sales",
+            color_discrete_sequence=COLORS,
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=350,
+            title="Sales Treemap: Region → Product",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Regional Satisfaction Comparison")
-    fig = px.box(df, x="Region", y="Customer_Satisfaction", color="Region", color_discrete_map=REGION_COLORS, points="outliers")
-    fig.update_layout(template="plotly_dark", height=400, showlegend=False, yaxis_title="Satisfaction Score")
+    fig = px.box(
+        df, x="Region", y="Customer_Satisfaction", color="Region",
+        color_discrete_map=REGION_COLORS, points="outliers",
+    )
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=400, showlegend=False,
+        yaxis_title="Satisfaction Score",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Monthly Trend by Region")
-    reg_monthly = df.groupby(["Month", "Region"])["Sales"].sum().reset_index()
-    fig = px.line(reg_monthly, x="Month", y="Sales", color="Region", color_discrete_map=REGION_COLORS, markers=True)
-    fig.update_layout(template="plotly_dark", height=400, xaxis=dict(tickangle=-45, dtick=3), hovermode="x unified")
+    reg_monthly = (
+        df.groupby(["Month", "Region"])["Sales"].sum().reset_index()
+    )
+    fig = px.line(
+        reg_monthly, x="Month", y="Sales", color="Region",
+        color_discrete_map=REGION_COLORS, markers=True,
+    )
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=400,
+        xaxis={"tickangle": -45, "dtick": 3}, hovermode="x unified",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Region × Product Performance")
-    reg_prod = df.groupby(["Region", "Product"]).agg({"Sales": "sum", "Customer_Satisfaction": "mean"}).reset_index()
-    fig = px.bar(reg_prod, x="Region", y="Sales", color="Product", color_discrete_map=PRODUCT_COLORS, barmode="group", text_auto=",.0f")
-    fig.update_layout(template="plotly_dark", height=400, yaxis_title="Sales ($)")
+    reg_prod = (
+        df.groupby(["Region", "Product"])
+        .agg({"Sales": "sum", "Customer_Satisfaction": "mean"})
+        .reset_index()
+    )
+    fig = px.bar(
+        reg_prod, x="Region", y="Sales", color="Product",
+        color_discrete_map=PRODUCT_COLORS, barmode="group",
+        text_auto=",.0f",
+    )
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=400, yaxis_title="Sales ($)",
+    )
     fig.update_traces(textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
 
 # ──────────────────────── CUSTOMER DEMOGRAPHICS ────────────────────────
 
 elif view == "👥 Customer Demographics":
-    st.markdown(
-        '<div class="section-header"><h2>Customer Demographics & Behavior</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Customer Demographics & Behavior")
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        render_metric("Avg Customer Age", f"{df['Customer_Age'].mean():.1f} yrs")
+        render_metric(
+            "Avg Customer Age", f"{df['Customer_Age'].mean():.1f} yrs",
+        )
     with col2:
-        render_metric("Female Customers", f"{(df['Customer_Gender'] == 'Female').sum():,}")
+        render_metric(
+            "Female Customers",
+            f"{(df['Customer_Gender'] == 'Female').sum():,}",
+        )
     with col3:
-        render_metric("Male Customers", f"{(df['Customer_Gender'] == 'Male').sum():,}")
+        render_metric(
+            "Male Customers",
+            f"{(df['Customer_Gender'] == 'Male').sum():,}",
+        )
 
     st.markdown("")
     col1, col2 = st.columns(2)
 
     with col1:
-        fig = px.histogram(df, x="Customer_Age", nbins=25, color_discrete_sequence=["#6366f1"], marginal="box")
-        fig.update_layout(template="plotly_dark", height=400, title="Age Distribution", xaxis_title="Age", yaxis_title="Count")
+        fig = px.histogram(
+            df, x="Customer_Age", nbins=25,
+            color_discrete_sequence=["#6366f1"], marginal="box",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400, title="Age Distribution",
+            xaxis_title="Age", yaxis_title="Count",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        gender_agg = df.groupby("Customer_Gender").agg(
-            Total_Sales=("Sales", "sum"),
-            Avg_Sale=("Sales", "mean"),
-            Count=("Sales", "count"),
-            Satisfaction=("Customer_Satisfaction", "mean"),
-        ).reset_index()
-        fig = px.bar(
-            gender_agg, x="Customer_Gender", y=["Total_Sales", "Avg_Sale"],
-            barmode="group", color_discrete_sequence=["#6366f1", "#22d3ee"], text_auto=",.0f",
+        gender_agg = (
+            df.groupby("Customer_Gender")
+            .agg(
+                Total_Sales=("Sales", "sum"),
+                Avg_Sale=("Sales", "mean"),
+                Count=("Sales", "count"),
+                Satisfaction=("Customer_Satisfaction", "mean"),
+            )
+            .reset_index()
         )
-        fig.update_layout(template="plotly_dark", height=400, title="Sales by Gender", xaxis_title="", yaxis_title="Amount ($)")
+        fig = px.bar(
+            gender_agg, x="Customer_Gender",
+            y=["Total_Sales", "Avg_Sale"], barmode="group",
+            color_discrete_sequence=["#6366f1", "#22d3ee"],
+            text_auto=",.0f",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400, title="Sales by Gender",
+            xaxis_title="", yaxis_title="Amount ($)",
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Sales by Age Group")
-    age_agg = df.groupby("Age_Group", observed=True).agg(
-        Total_Sales=("Sales", "sum"),
-        Avg_Sale=("Sales", "mean"),
-        Count=("Sales", "count"),
-        Satisfaction=("Customer_Satisfaction", "mean"),
-    ).reset_index()
+    age_agg = (
+        df.groupby("Age_Group", observed=True)
+        .agg(
+            Total_Sales=("Sales", "sum"),
+            Avg_Sale=("Sales", "mean"),
+            Count=("Sales", "count"),
+            Satisfaction=("Customer_Satisfaction", "mean"),
+        )
+        .reset_index()
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        fig = px.bar(age_agg, x="Age_Group", y="Total_Sales", color="Age_Group", color_discrete_sequence=COLORS, text_auto=",.0f")
-        fig.update_layout(template="plotly_dark", height=400, title="Revenue by Age Group", showlegend=False, xaxis_title="Age Group", yaxis_title="Total Sales ($)")
+        fig = px.bar(
+            age_agg, x="Age_Group", y="Total_Sales", color="Age_Group",
+            color_discrete_sequence=COLORS, text_auto=",.0f",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400,
+            title="Revenue by Age Group", showlegend=False,
+            xaxis_title="Age Group", yaxis_title="Total Sales ($)",
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        fig = px.bar(age_agg, x="Age_Group", y="Satisfaction", color="Age_Group", color_discrete_sequence=COLORS, text_auto=".2f")
-        fig.update_layout(template="plotly_dark", height=400, title="Satisfaction by Age Group", showlegend=False, xaxis_title="Age Group", yaxis_title="Avg Satisfaction")
+        fig = px.bar(
+            age_agg, x="Age_Group", y="Satisfaction", color="Age_Group",
+            color_discrete_sequence=COLORS, text_auto=".2f",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=400,
+            title="Satisfaction by Age Group", showlegend=False,
+            xaxis_title="Age Group", yaxis_title="Avg Satisfaction",
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Customer Scatter: Age vs Sales vs Satisfaction")
     fig = px.scatter(
-        df, x="Customer_Age", y="Sales", color="Customer_Satisfaction",
-        color_continuous_scale="Viridis", size="Sales", size_max=10, opacity=0.6,
+        df, x="Customer_Age", y="Sales",
+        color="Customer_Satisfaction",
+        color_continuous_scale="Viridis", size="Sales", size_max=10,
+        opacity=0.6,
         hover_data=["Product", "Region", "Customer_Gender"],
     )
-    fig.update_layout(template="plotly_dark", height=450, xaxis_title="Customer Age", yaxis_title="Sales ($)")
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=450,
+        xaxis_title="Customer Age", yaxis_title="Sales ($)",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Gender × Product Breakdown")
-    gp = df.groupby(["Customer_Gender", "Product"])["Sales"].sum().reset_index()
-    fig = px.bar(gp, x="Product", y="Sales", color="Customer_Gender", barmode="group", color_discrete_sequence=["#6366f1", "#ef4444"], text_auto=",.0f")
-    fig.update_layout(template="plotly_dark", height=400, yaxis_title="Sales ($)")
+    gp = (
+        df.groupby(["Customer_Gender", "Product"])["Sales"]
+        .sum()
+        .reset_index()
+    )
+    fig = px.bar(
+        gp, x="Product", y="Sales", color="Customer_Gender",
+        barmode="group", color_discrete_sequence=["#6366f1", "#ef4444"],
+        text_auto=",.0f",
+    )
+    fig.update_layout(
+        template=CHART_TEMPLATE, height=400, yaxis_title="Sales ($)",
+    )
     fig.update_traces(textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
 
 # ──────────────────────── ADVANCED ANALYTICS ────────────────────────
 
 elif view == "🔬 Advanced Analytics":
-    st.markdown(
-        '<div class="section-header"><h2>Advanced Analytics</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Advanced Analytics")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Correlations", "Distributions", "Time Decomposition", "Segmentation"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Correlations", "Distributions", "Time Decomposition", "Segmentation"],
+    )
 
     with tab1:
         st.markdown("#### Correlation Matrix")
         corr_cols = ["Sales", "Customer_Age", "Customer_Satisfaction"]
         corr_matrix = df[corr_cols].corr().round(3)
-        fig = px.imshow(corr_matrix, text_auto=".3f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto")
-        fig.update_layout(template="plotly_dark", height=400)
+        fig = px.imshow(
+            corr_matrix, text_auto=".3f",
+            color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+            aspect="auto",
+        )
+        fig.update_layout(template=CHART_TEMPLATE, height=400)
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("#### Pairwise Scatter Matrix")
-        fig = px.scatter_matrix(df, dimensions=corr_cols, color="Product", color_discrete_map=PRODUCT_COLORS, opacity=0.4, height=600)
-        fig.update_layout(template="plotly_dark")
-        fig.update_traces(diagonal_visible=False, marker=dict(size=3))
+        fig = px.scatter_matrix(
+            df, dimensions=corr_cols, color="Product",
+            color_discrete_map=PRODUCT_COLORS, opacity=0.4, height=600,
+        )
+        fig.update_layout(template=CHART_TEMPLATE)
+        fig.update_traces(diagonal_visible=False, marker={"size": 3})
         st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         st.markdown("#### Sales Distribution by Product")
-        fig = px.violin(df, x="Product", y="Sales", color="Product", color_discrete_map=PRODUCT_COLORS, box=True, points="outliers")
-        fig.update_layout(template="plotly_dark", height=450, showlegend=False, yaxis_title="Sales ($)")
+        fig = px.violin(
+            df, x="Product", y="Sales", color="Product",
+            color_discrete_map=PRODUCT_COLORS, box=True,
+            points="outliers",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=450, showlegend=False,
+            yaxis_title="Sales ($)",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("#### Satisfaction Distribution by Region")
-        fig = px.violin(df, x="Region", y="Customer_Satisfaction", color="Region", color_discrete_map=REGION_COLORS, box=True, points="outliers")
-        fig.update_layout(template="plotly_dark", height=450, showlegend=False, yaxis_title="Satisfaction Score")
+        fig = px.violin(
+            df, x="Region", y="Customer_Satisfaction", color="Region",
+            color_discrete_map=REGION_COLORS, box=True, points="outliers",
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=450, showlegend=False,
+            yaxis_title="Satisfaction Score",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with tab3:
         st.markdown("#### Monthly Sales Decomposition")
-        monthly_ts = df.groupby("Month")["Sales"].agg(["sum", "mean", "count", "std"]).reset_index()
+        monthly_ts = (
+            df.groupby("Month")["Sales"]
+            .agg(["sum", "mean", "count", "std"])
+            .reset_index()
+        )
         monthly_ts.columns = ["Month", "Total", "Mean", "Count", "StdDev"]
         monthly_ts["StdDev"] = monthly_ts["StdDev"].fillna(0)
 
         fig = make_subplots(
             rows=3, cols=1, shared_xaxes=True,
-            subplot_titles=("Total Sales", "Transaction Count", "Sales Volatility (Std Dev)"),
+            subplot_titles=(
+                "Total Sales", "Transaction Count",
+                "Sales Volatility (Std Dev)",
+            ),
             vertical_spacing=0.08,
         )
-        fig.add_trace(go.Scatter(x=monthly_ts["Month"], y=monthly_ts["Total"], mode="lines+markers", line=dict(color="#6366f1"), name="Total Sales"), row=1, col=1)
-        fig.add_trace(go.Bar(x=monthly_ts["Month"], y=monthly_ts["Count"], marker_color="#22d3ee", name="Transactions"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=monthly_ts["Month"], y=monthly_ts["StdDev"], mode="lines", fill="tozeroy", line=dict(color="#f59e0b"), name="Std Dev"), row=3, col=1)
-        fig.update_layout(template="plotly_dark", height=700, showlegend=False, xaxis3=dict(tickangle=-45, dtick=6))
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_ts["Month"], y=monthly_ts["Total"],
+                mode="lines+markers", line={"color": "#6366f1"},
+                name="Total Sales",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=monthly_ts["Month"], y=monthly_ts["Count"],
+                marker_color="#22d3ee", name="Transactions",
+            ),
+            row=2, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_ts["Month"], y=monthly_ts["StdDev"],
+                mode="lines", fill="tozeroy",
+                line={"color": "#f59e0b"}, name="Std Dev",
+            ),
+            row=3, col=1,
+        )
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=700, showlegend=False,
+            xaxis3={"tickangle": -45, "dtick": 6},
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with tab4:
-        st.markdown("#### Customer Segmentation: Age Group × Satisfaction Level")
-        seg = df.groupby(["Age_Group", "Satisfaction_Level"], observed=True).agg(
-            Count=("Sales", "count"), Avg_Sales=("Sales", "mean"),
-        ).reset_index()
+        st.markdown(
+            "#### Customer Segmentation: Age Group × Satisfaction Level"
+        )
+        seg = (
+            df.groupby(["Age_Group", "Satisfaction_Level"], observed=True)
+            .agg(Count=("Sales", "count"), Avg_Sales=("Sales", "mean"))
+            .reset_index()
+        )
         fig = px.scatter(
             seg, x="Age_Group", y="Satisfaction_Level",
-            size="Count", color="Avg_Sales", color_continuous_scale="Viridis",
-            size_max=40, hover_data=["Count", "Avg_Sales"],
+            size="Count", color="Avg_Sales",
+            color_continuous_scale="Viridis", size_max=40,
+            hover_data=["Count", "Avg_Sales"],
         )
-        fig.update_layout(template="plotly_dark", height=450, xaxis_title="Age Group", yaxis_title="Satisfaction Level")
+        fig.update_layout(
+            template=CHART_TEMPLATE, height=450,
+            xaxis_title="Age Group", yaxis_title="Satisfaction Level",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("#### Top / Bottom Performing Segments")
-        seg_detail = df.groupby(["Product", "Region", "Customer_Gender"]).agg(
-            Revenue=("Sales", "sum"),
-            Transactions=("Sales", "count"),
-            Avg_Sale=("Sales", "mean"),
-            Satisfaction=("Customer_Satisfaction", "mean"),
-        ).round(2).reset_index().sort_values("Revenue", ascending=False)
+        seg_detail = (
+            df.groupby(["Product", "Region", "Customer_Gender"])
+            .agg(
+                Revenue=("Sales", "sum"),
+                Transactions=("Sales", "count"),
+                Avg_Sale=("Sales", "mean"),
+                Satisfaction=("Customer_Satisfaction", "mean"),
+            )
+            .round(2)
+            .reset_index()
+            .sort_values("Revenue", ascending=False)
+        )
 
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**🏆 Top 10 Segments by Revenue**")
-            st.dataframe(seg_detail.head(10), use_container_width=True, hide_index=True)
+            st.dataframe(
+                seg_detail.head(10),
+                use_container_width=True, hide_index=True,
+            )
         with col2:
             st.markdown("**⚠️ Bottom 10 Segments by Revenue**")
-            st.dataframe(seg_detail.tail(10).sort_values("Revenue"), use_container_width=True, hide_index=True)
+            st.dataframe(
+                seg_detail.tail(10).sort_values("Revenue"),
+                use_container_width=True, hide_index=True,
+            )
 
 # ──────────────────────── AI ASSISTANT ────────────────────────
 
 elif view == "🤖 AI Assistant":
-    st.markdown(
-        '<div class="section-header"><h2>Chat with InsightForge</h2></div>',
-        unsafe_allow_html=True,
-    )
+    render_section_header("Chat with InsightForge")
 
-    with st.spinner("Loading AI models..."):
-        llm, vectorstore = initialize_rag_system(df_raw)
+    try:
+        with st.spinner("Loading AI models..."):
+            llm, vectorstore = initialize_rag_system(df_raw)
+    except Exception:
+        logger.exception("RAG system initialisation failed")
+        st.error(
+            "Could not initialise the AI assistant. "
+            "Make sure Ollama is running with the required models "
+            f"(`{LLM_MODEL}` and `{EMBEDDING_MODEL}`)."
+        )
+        st.stop()
 
     col1, col2 = st.columns([3, 1])
     with col2:
@@ -630,31 +1029,65 @@ elif view == "🤖 AI Assistant":
                 st.markdown(message["content"])
 
         if prompt := st.chat_input("Ask about your sales data..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.session_state.messages.append(
+                {"role": "user", "content": prompt}
+            )
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                with st.spinner("Analyzing data..."):
-                    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-                    docs = retriever.invoke(prompt)
-                    context = "\n".join([d.page_content for d in docs])
+                try:
+                    with st.spinner("Analyzing data..."):
+                        from langchain_core.output_parsers import (
+                            StrOutputParser,
+                        )
+                        from langchain_core.prompts import ChatPromptTemplate
 
-                    template = ChatPromptTemplate.from_messages([
-                        ("system",
-                         "You are InsightForge, an expert BI analyst. Answer questions using ONLY the data context provided. "
-                         "Be precise with numbers. Use bullet points for comparisons. "
-                         "If the data doesn't contain the answer, say so clearly."),
-                        ("human", "Data Context:\n{context}\n\nQuestion: {question}"),
-                    ])
+                        retriever = vectorstore.as_retriever(
+                            search_kwargs={"k": RAG_TOP_K},
+                        )
+                        docs = retriever.invoke(prompt)
+                        context = "\n".join(
+                            d.page_content for d in docs
+                        )
 
-                    chain = template | llm | StrOutputParser()
-                    response = chain.invoke({"context": context, "question": prompt})
+                        template = ChatPromptTemplate.from_messages([
+                            (
+                                "system",
+                                "You are InsightForge, an expert BI analyst. "
+                                "Answer questions using ONLY the data context "
+                                "provided. Be precise with numbers. Use bullet "
+                                "points for comparisons. If the data doesn't "
+                                "contain the answer, say so clearly.",
+                            ),
+                            (
+                                "human",
+                                "Data Context:\n{context}\n\n"
+                                "Question: {question}",
+                            ),
+                        ])
 
-                st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+                        chain = template | llm | StrOutputParser()
+                        response = chain.invoke(
+                            {"context": context, "question": prompt},
+                        )
+
+                    st.markdown(response)
+                except Exception:
+                    logger.exception("LLM inference failed")
+                    response = (
+                        "Sorry, I encountered an error while processing your "
+                        "question. Please check that Ollama is running and "
+                        "try again."
+                    )
+                    st.error(response)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": response},
+            )
 
 # ──────────────────────── FOOTER ────────────────────────
 
 st.sidebar.markdown("---")
-st.sidebar.caption("InsightForge v2.0 · Powered by Ollama + LangChain")
+st.sidebar.caption(
+    f"InsightForge v{APP_VERSION} · Powered by Ollama + LangChain"
+)

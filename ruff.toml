@@ -1,0 +1,7 @@
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "C4", "UP", "B"]
+ignore = [
+    "E501",  # line length handled by formatter; CSS/HTML strings may exceed
+]
