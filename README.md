@@ -20,8 +20,6 @@
 - [Notebook](#notebook)
 - [Configuration](#configuration)
 - [Code Quality](#code-quality)
-- [Contributing](#contributing)
-- [License](#license)
 
 ---
 
@@ -255,17 +253,3 @@ pip-audit -r requirements.txt
 
 The project uses `ruff.toml` with rules `E`, `F`, `W`, `I`, `C4`, `UP`, `B` at line-length 100. All checks pass with zero errors.
 
----
-
-## Contributing
-
-1. Fork the repository and create a feature branch (`git checkout -b feat/my-feature`)
-2. Make your changes and ensure `ruff check` passes
-3. Commit with a descriptive message
-4. Open a pull request against `dev`
-
----
-
-## License
-
-This project is submitted as an academic capstone. All rights reserved by the author.
