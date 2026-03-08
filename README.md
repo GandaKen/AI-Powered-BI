@@ -25,7 +25,7 @@
 
 ## Overview
 
-InsightForge is a capstone project for the **Simplilearn Advanced Generative AI** programme. It demonstrates how large language models can be integrated into a traditional BI workflow to:
+InsightForge demonstrates how large language models can be integrated into a traditional BI workflow to:
 
 - Explore 2,500 sales transactions across six interactive dashboard views
 - Answer free-form business questions via a RAG pipeline (FAISS + Ollama)
