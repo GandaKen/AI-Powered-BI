@@ -1,0 +1,14 @@
+# Virtual environment
+venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Project-specific exclusions
+Capstone_Problem_Statement_Enabling_AI-Powered_Business_Intelligence_for_Organizations.docx
+InsightForge_Assistant_executed.ipynb
+sales_data_quiz.md
