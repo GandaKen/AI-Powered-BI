@@ -8,6 +8,9 @@ __pycache__/
 # Environment variables
 .env
 
+# Internal docs
+docs/
+
 # Project-specific exclusions
 Capstone_Problem_Statement_Enabling_AI-Powered_Business_Intelligence_for_Organizations.docx
 InsightForge_Assistant_executed.ipynb

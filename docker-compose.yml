@@ -1,0 +1,80 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: insightforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: insightforge-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "ollama pull llama3.1:8b && ollama pull llama3.2:3b && ollama pull nomic-embed-text"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+
+  bifrost:
+    image: maximhq/bifrost:latest
+    container_name: insightforge-bifrost
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./bifrost/config.json:/app/config/config.json:ro
+    depends_on:
+      - ollama
+
+  langfuse:
+    image: langfuse/langfuse:latest
+    container_name: insightforge-langfuse
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - NEXTAUTH_SECRET=insightforge-langfuse-secret
+      - NEXTAUTH_URL=http://localhost:3000
+      - SALT=insightforge-salt
+    depends_on:
+      - langfuse-db
+
+  langfuse-db:
+    image: postgres:15-alpine
+    container_name: insightforge-langfuse-db
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_data:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: insightforge-app
+    ports:
+      - "8501:8501"
+    environment:
+      - BIFROST_BASE_URL=http://bifrost:8080
+      - LLM_MODEL_LIGHT=llama3.2:3b
+      - LLM_MODEL_HEAVY=llama3.1:8b
+      - EMBEDDING_MODEL=nomic-embed-text
+      - RAG_TOP_K=5
+      - MAX_EVAL_RETRIES=1
+    depends_on:
+      - bifrost
+
+volumes:
+  ollama_data:
+  langfuse_data:
+

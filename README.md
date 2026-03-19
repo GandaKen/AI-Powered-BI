@@ -43,32 +43,22 @@ InsightForge demonstrates how large language models can be integrated into a tra
 
 ## Architecture
 
+The AI Assistant uses a **6-node LangGraph agentic RAG pipeline**:
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  Streamlit Dashboard                    │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
-│  │  Sales   │ │ Product  │ │ Regional │ │Customer  │  │
-│  │ Overview │ │ Analysis │ │ Analysis │ │  Demo.   │  │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
-│  ┌──────────────────────┐  ┌─────────────────────────┐ │
-│  │  Advanced Analytics  │  │      AI Assistant       │ │
-│  └──────────────────────┘  └───────────┬─────────────┘ │
-└──────────────────────────────────────────┼──────────────┘
-                                           │
-                              ┌────────────▼─────────────┐
-                              │      RAG Pipeline        │
-                              │  FAISS Vector Store      │
-                              │  Ollama nomic-embed-text  │
-                              │  Ollama llama3.2:3b LLM  │
-                              └──────────────────────────┘
-                                           │
-                              ┌────────────▼─────────────┐
-                              │      sales_data.csv      │
-                              │   2,500 transactions     │
-                              └──────────────────────────┘
+QueryPlanner → RetrievalPlanner → InformationRetriever → ContextAssembler → Generator → ResponseQA
+       ↑                                                                                    │
+       └────────────────────────── retry (max 1) ──────────────────────────────────────────┘
 ```
 
-**RAG document index** is built from aggregated statistics (dataset overview, per-product, per-region, cross-segment, gender, and monthly trend summaries) embedded with `nomic-embed-text` and indexed in FAISS.
+- **QueryPlanner**: Intent classification, task breakdown, LLM guardrail
+- **RetrievalPlanner**: Maps tasks to tools (vector_search, data_analysis, statistical)
+- **InformationRetriever**: Executes tool calls
+- **ContextAssembler**: Merges chunks, dynamic token budget
+- **Generator**: BI analyst response (llama3.1:8b)
+- **ResponseQA**: Evaluate + refine, optional retry
+
+**Infrastructure** (Docker Compose): Streamlit App → Bifrost Gateway → Ollama. Optional Langfuse for observability.
 
 ---
 
@@ -90,11 +80,20 @@ InsightForge demonstrates how large language models can be integrated into a tra
 ```
 AI-Powered-BI/
 ├── insightforge_app.py          # Streamlit dashboard (main entry point)
-├── InsightForge_Assistant.ipynb # Development & evaluation notebook
-├── sales_data.csv               # Source dataset (2,500 transactions)
-├── requirements.txt             # Pinned Python dependencies
-├── ruff.toml                    # Linter configuration
-├── .gitignore
+├── insightforge/                 # Agentic RAG package
+│   ├── config.py                # Pydantic Settings (env-driven)
+│   ├── llm/                     # Provider, guardrail
+│   ├── retrieval/               # Documents, FAISS vectorstore
+│   ├── agent/                   # LangGraph nodes, tools, graph
+│   ├── observability/           # Langfuse tracing
+│   └── prompts/
+├── helm/                        # Kubernetes Helm chart
+├── bifrost/config.json          # Bifrost → Ollama routing
+├── docker-compose.yml           # Ollama + Bifrost + Langfuse + App
+├── Dockerfile
+├── tests/
+├── requirements.txt
+├── pyproject.toml
 └── README.md
 ```
 
@@ -122,9 +121,10 @@ AI-Powered-BI/
 
 | Requirement | Notes |
 |---|---|
-| Python 3.10+ | Tested on 3.12 |
+| Python 3.11+ | Tested on 3.12 |
 | [Ollama](https://ollama.com) | Running locally on default port 11434 |
 | `llama3.2:3b` model | `ollama pull llama3.2:3b` |
+| `llama3.1:8b` model | `ollama pull llama3.1:8b` (for agent quality nodes) |
 | `nomic-embed-text` model | `ollama pull nomic-embed-text` |
 | OpenAI API key *(notebook only)* | Set in `.env` as `OPENAI_API_KEY` |
 
@@ -171,6 +171,8 @@ cp .env.example .env            # then edit .env
 
 ## Running the App
 
+### Local (Ollama)
+
 ```bash
 # Ensure Ollama is running in a separate terminal
 ollama serve
@@ -179,7 +181,19 @@ ollama serve
 streamlit run insightforge_app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+### Docker Compose (Ollama + Bifrost + App + Langfuse)
+
+```bash
+docker compose up --build
+```
+
+Then open [http://localhost:8501](http://localhost:8501). The first run pulls Ollama models via an init container.
+
+### Kubernetes
+
+```bash
+helm install insightforge ./helm
+```
 
 ### Dashboard Views
 
@@ -225,16 +239,17 @@ All views respect global filters applied from the sidebar: **date range**, **pro
 
 ## Configuration
 
-All tuneable values in `insightforge_app.py` are collected at the top of the file:
+Environment variables (see `.env.example`):
 
-```python
-DATA_PATH       = Path("sales_data.csv")   # path to the dataset
-LLM_MODEL       = "llama3.2:3b"            # Ollama chat model
-EMBEDDING_MODEL = "nomic-embed-text"       # Ollama embedding model
-LLM_TEMPERATURE = 0                        # deterministic responses
-RAG_TOP_K       = 5                        # documents retrieved per query
-CHART_TEMPLATE  = "plotly_dark"            # Plotly theme
-```
+| Variable | Default | Description |
+|---|---|---|
+| `BIFROST_BASE_URL` | `http://localhost:8080` | Bifrost gateway (or direct Ollama fallback) |
+| `LLM_MODEL_LIGHT` | `llama3.2:3b` | Planning / routing nodes |
+| `LLM_MODEL_HEAVY` | `llama3.1:8b` | Generator / ResponseQA |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | FAISS embeddings |
+| `RAG_TOP_K` | `5` | Retrieved chunks per query |
+| `MAX_EVAL_RETRIES` | `1` | Retry loop cap |
+| `LANGFUSE_*` | (optional) | Observability |
 
 ---
 
@@ -242,14 +257,14 @@ CHART_TEMPLATE  = "plotly_dark"            # Plotly theme
 
 ```bash
 # Lint
-ruff check insightforge_app.py
+ruff check .
 
-# Lint + auto-fix
-ruff check insightforge_app.py --fix
+# Tests
+pytest tests/ -v --cov=insightforge
 
-# Audit dependencies for CVEs
-pip-audit -r requirements.txt
+# Type check
+mypy insightforge/ --ignore-missing-imports
 ```
 
-The project uses `ruff.toml` with rules `E`, `F`, `W`, `I`, `C4`, `UP`, `B` at line-length 100. All checks pass with zero errors.
+The project uses `ruff.toml` with rules `E`, `F`, `W`, `I`, `C4`, `UP`, `B` at line-length 100.
 

@@ -1,0 +1,54 @@
+replicaCount: 1
+
+image:
+  repository: insightforge
+  tag: latest
+  pullPolicy: IfNotPresent
+
+app:
+  port: 8501
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+    requests:
+      cpu: "500m"
+      memory: 512Mi
+
+ollama:
+  enabled: true
+  port: 11434
+  resources:
+    limits:
+      cpu: "4"
+      memory: 8Gi
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "1"
+      memory: 4Gi
+
+bifrost:
+  enabled: true
+  port: 8080
+
+env:
+  BIFROST_BASE_URL: "http://bifrost:8080"
+  LLM_MODEL_LIGHT: "llama3.2:3b"
+  LLM_MODEL_HEAVY: "llama3.1:8b"
+  EMBEDDING_MODEL: "nomic-embed-text"
+  RAG_TOP_K: "5"
+  MAX_EVAL_RETRIES: "1"
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: 8501
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: 8501
+  initialDelaySeconds: 10
+  periodSeconds: 5

@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "ollama": {
+      "keys": [
+        {
+          "name": "local",
+          "value": "ollama",
+          "models": [
+            "llama3.2:3b",
+            "llama3.1:8b",
+            "nomic-embed-text"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://ollama:11434"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,2 @@
+"""InsightForge agentic RAG package."""
+

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: insightforge
+description: InsightForge AI-Powered BI Assistant
+type: application
+version: 0.1.0
+appVersion: "2.0"
+keywords:
+  - bi
+  - streamlit
+  - ollama
+  - langchain

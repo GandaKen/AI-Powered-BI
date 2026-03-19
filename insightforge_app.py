@@ -12,8 +12,10 @@ Requirements:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -23,6 +25,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+
+from insightforge.agent import create_agent
+from insightforge.config import settings as agent_settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,8 @@ LLM_MODEL: str = "llama3.2:3b"
 EMBEDDING_MODEL: str = "nomic-embed-text"
 LLM_TEMPERATURE: float = 0
 RAG_TOP_K: int = 5
+HEAVY_MODEL: str = agent_settings.llm_model_heavy
+CIRCUIT_BREAKER_THRESHOLD: int = 3
 
 CHART_TEMPLATE: str = "plotly_dark"
 
@@ -278,6 +285,38 @@ def initialize_rag_system(_df: pd.DataFrame):
 
     vectorstore = FAISS.from_documents(documents, embeddings)
     return llm, vectorstore
+
+
+@st.cache_resource
+def initialize_agent_system(_df: pd.DataFrame):
+    """Build the LangGraph-based agentic RAG system."""
+    return create_agent(_df, agent_settings)
+
+
+def run_basic_rag(prompt: str, llm, vectorstore) -> str:
+    """Run the legacy chain-based RAG as fallback path."""
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": RAG_TOP_K})
+    docs = retriever.invoke(prompt)
+    context = "\n".join(d.page_content for d in docs)
+
+    template = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are InsightForge, an expert BI analyst. "
+            "Answer questions using ONLY the data context provided. "
+            "Be precise with numbers. Use bullet points for comparisons. "
+            "If the data doesn't contain the answer, say so clearly.",
+        ),
+        (
+            "human",
+            "Data Context:\n{context}\n\nQuestion: {question}",
+        ),
+    ])
+    chain = template | llm | StrOutputParser()
+    return chain.invoke({"context": context, "question": prompt})
 
 
 # ---------------------------------------------------------------------------
@@ -995,22 +1034,33 @@ elif view == "🔬 Advanced Analytics":
 elif view == "🤖 AI Assistant":
     render_section_header("Chat with InsightForge")
 
+    agent_graph = None
+    fallback_rag = None
+
     try:
-        with st.spinner("Loading AI models..."):
-            llm, vectorstore = initialize_rag_system(df_raw)
+        with st.spinner("Loading agentic RAG..."):
+            agent_graph = initialize_agent_system(df_raw)
     except Exception:
-        logger.exception("RAG system initialisation failed")
-        st.error(
-            "Could not initialise the AI assistant. "
-            "Make sure Ollama is running with the required models "
-            f"(`{LLM_MODEL}` and `{EMBEDDING_MODEL}`)."
-        )
-        st.stop()
+        logger.exception("Agentic RAG initialization failed; trying fallback chain")
+
+    try:
+        with st.spinner("Loading fallback RAG..."):
+            fallback_rag = initialize_rag_system(df_raw)
+    except Exception:
+        logger.exception("Fallback RAG initialisation failed")
+        if agent_graph is None:
+            st.error(
+                "Could not initialise the AI assistant. "
+                "Make sure Ollama is running with the required models "
+                f"(`{LLM_MODEL}`, `{HEAVY_MODEL}`, and `{EMBEDDING_MODEL}`)."
+            )
+            st.stop()
 
     col1, col2 = st.columns([3, 1])
     with col2:
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.agent_consecutive_failures = 0
             st.rerun()
         st.markdown("**💡 Try asking:**")
         sample_qs = [
@@ -1040,49 +1090,96 @@ elif view == "🤖 AI Assistant":
 
             with st.chat_message("assistant"):
                 try:
-                    with st.spinner("Analyzing data..."):
-                        from langchain_core.output_parsers import (
-                            StrOutputParser,
-                        )
-                        from langchain_core.prompts import ChatPromptTemplate
+                    agent_result = None
+                    consecutive_failures = st.session_state.get(
+                        "agent_consecutive_failures", 0
+                    )
+                    use_agent = (
+                        agent_graph is not None
+                        and consecutive_failures < CIRCUIT_BREAKER_THRESHOLD
+                    )
+                    if use_agent:
+                        with st.status("Running agent workflow...", expanded=False) as status:
+                            status.write("Analyzing query...")
+                            status.write("Planning retrieval...")
+                            status.write("Searching data sources...")
+                            status.write("Generating and quality-checking response...")
+                            start = time.perf_counter()
+                            try:
+                                agent_result = agent_graph.invoke(
+                                    {
+                                        "query": prompt,
+                                        "messages": st.session_state.messages,
+                                        "retry_count": 0,
+                                        "trace_steps": [],
+                                    }
+                                )
+                                st.session_state.agent_consecutive_failures = 0
+                                logger.info(
+                                    json.dumps({
+                                        "event": "agent_success",
+                                        "latency_ms": (time.perf_counter() - start) * 1000,
+                                        "query_len": len(prompt),
+                                        "trace": agent_result.get("trace_steps", []),
+                                    })
+                                )
+                            except Exception as agent_err:
+                                st.session_state.agent_consecutive_failures = (
+                                    consecutive_failures + 1
+                                )
+                                logger.warning(
+                                    json.dumps({
+                                        "event": "agent_failure",
+                                        "consecutive_failures": st.session_state.agent_consecutive_failures,
+                                        "error": str(agent_err),
+                                    })
+                                )
+                                raise
+                            status.update(label="Agent workflow complete", state="complete")
 
-                        retriever = vectorstore.as_retriever(
-                            search_kwargs={"k": RAG_TOP_K},
+                    if agent_result is not None:
+                        response = agent_result.get("final_response") or agent_result.get(
+                            "generated_response", "I could not generate a response."
                         )
-                        docs = retriever.invoke(prompt)
-                        context = "\n".join(
-                            d.page_content for d in docs
-                        )
+                        score = agent_result.get("evaluation", {}).get("score")
+                        if score is not None:
+                            st.caption(f"Quality score: **{score}/10**")
 
-                        template = ChatPromptTemplate.from_messages([
-                            (
-                                "system",
-                                "You are InsightForge, an expert BI analyst. "
-                                "Answer questions using ONLY the data context "
-                                "provided. Be precise with numbers. Use bullet "
-                                "points for comparisons. If the data doesn't "
-                                "contain the answer, say so clearly.",
-                            ),
-                            (
-                                "human",
-                                "Data Context:\n{context}\n\n"
-                                "Question: {question}",
-                            ),
-                        ])
-
-                        chain = template | llm | StrOutputParser()
-                        response = chain.invoke(
-                            {"context": context, "question": prompt},
-                        )
+                        with st.expander("Agent Reasoning"):
+                            st.write("Nodes:", " -> ".join(agent_result.get("trace_steps", [])))
+                            st.write("Safety:", agent_result.get("safety_check", {}))
+                            st.write(
+                                "Retrieval strategy:",
+                                agent_result.get("retrieval_strategy", {}),
+                            )
+                            st.write("Evaluation:", agent_result.get("evaluation", {}))
+                    elif fallback_rag is not None:
+                        llm, vectorstore = fallback_rag
+                        response = run_basic_rag(prompt, llm, vectorstore)
+                    else:
+                        response = "AI assistant is temporarily unavailable."
 
                     st.markdown(response)
                 except Exception:
-                    logger.exception("LLM inference failed")
-                    response = (
-                        "Sorry, I encountered an error while processing your "
-                        "question. Please check that Ollama is running and "
-                        "try again."
-                    )
+                    logger.exception("Agent pipeline failed; trying fallback chain")
+                    if fallback_rag is not None:
+                        try:
+                            llm, vectorstore = fallback_rag
+                            response = run_basic_rag(prompt, llm, vectorstore)
+                            st.info("Used fallback RAG path due to agent runtime error.")
+                        except Exception:
+                            logger.exception("Fallback chain also failed")
+                            response = (
+                                "Sorry, I encountered an error while processing your "
+                                "question. Please check that Ollama is running and "
+                                "try again."
+                            )
+                    else:
+                        response = (
+                            "Sorry, I encountered an error while processing your "
+                            "question. Please check that Ollama is running and "
+                            "try again."
+                        )
                     st.error(response)
             st.session_state.messages.append(
                 {"role": "assistant", "content": response},
