@@ -34,28 +34,36 @@ services:
     depends_on:
       - ollama
 
-  langfuse:
-    image: langfuse/langfuse:latest
-    container_name: insightforge-langfuse
+  redis:
+    image: redis:7-alpine
+    container_name: insightforge-redis
     ports:
-      - "3000:3000"
-    environment:
-      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
-      - NEXTAUTH_SECRET=insightforge-langfuse-secret
-      - NEXTAUTH_URL=http://localhost:3000
-      - SALT=insightforge-salt
-    depends_on:
-      - langfuse-db
-
-  langfuse-db:
-    image: postgres:15-alpine
-    container_name: insightforge-langfuse-db
-    environment:
-      - POSTGRES_USER=langfuse
-      - POSTGRES_PASSWORD=langfuse
-      - POSTGRES_DB=langfuse
+      - "6379:6379"
     volumes:
-      - langfuse_data:/var/lib/postgresql/data
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: insightforge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=insightforge
+      - POSTGRES_PASSWORD=insightforge
+      - POSTGRES_DB=insightforge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U insightforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   app:
     build:
@@ -71,10 +79,21 @@ services:
       - EMBEDDING_MODEL=nomic-embed-text
       - RAG_TOP_K=5
       - MAX_EVAL_RETRIES=1
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://insightforge:insightforge@postgres:5432/insightforge
     depends_on:
-      - bifrost
+      bifrost:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
 volumes:
   ollama_data:
-  langfuse_data:
+  redis_data:
+  postgres_data:
 

@@ -1,2 +1,2 @@
-"""Observability helpers (Langfuse + structured logs)."""
+"""Observability helpers (Langfuse + local Postgres trace storage)."""
 

@@ -15,7 +15,11 @@ from insightforge.retrieval.vectorstore import VectorStoreManager
 
 
 def create_agent(df, settings: Settings):
-    """Construct full agentic RAG graph bound to a dataset."""
+    """Construct full agentic RAG graph bound to a dataset.
+
+    Langfuse cloud callbacks (stateless) are baked in at build time.
+    The per-request TraceCollector is added at invoke time by the Streamlit app.
+    """
     embeddings = get_embeddings(settings)
     docs = build_documents(df)
     vector_manager = VectorStoreManager(embeddings=embeddings).build(docs)
@@ -41,8 +45,7 @@ def create_agent(df, settings: Settings):
         tool_registry=tool_registry,
     )
 
-    callbacks = get_langfuse_callbacks(settings)
-    if callbacks:
-        return graph.with_config({"callbacks": callbacks})
+    langfuse_cbs = get_langfuse_callbacks(settings)
+    if langfuse_cbs:
+        return graph.with_config({"callbacks": langfuse_cbs})
     return graph
-

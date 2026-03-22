@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     token_budget_simple: int = Field(default=4000, alias="TOKEN_BUDGET_SIMPLE")
     token_budget_complex: int = Field(default=12000, alias="TOKEN_BUDGET_COMPLEX")
 
+    database_url: str = Field(
+        default="postgresql://insightforge:insightforge@localhost:5432/insightforge",
+        alias="DATABASE_URL",
+    )
+
     langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field(default="", alias="LANGFUSE_HOST")

@@ -28,6 +28,7 @@ from plotly.subplots import make_subplots
 
 from insightforge.agent import create_agent
 from insightforge.config import settings as agent_settings
+from insightforge.observability.tracing import make_trace_collector
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,35 @@ st.markdown(
     .metric-card .delta-neg { color: #f87171; font-size: 0.8rem; }
     .section-header { border-left: 4px solid #6366f1; padding-left: 12px; margin: 1.5rem 0 1rem 0; }
     div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+    .trace-card {
+        background: rgba(30, 27, 75, 0.6);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.4rem;
+        display: flex; align-items: center; gap: 0.8rem;
+    }
+    .trace-card .step-name {
+        font-weight: 600; font-size: 0.82rem; color: #e0e7ff;
+        min-width: 150px;
+    }
+    .trace-bar-bg {
+        flex: 1; height: 8px; background: rgba(99, 102, 241, 0.15);
+        border-radius: 4px; overflow: hidden;
+    }
+    .trace-bar-fill { height: 100%; border-radius: 4px; }
+    .trace-stat {
+        font-size: 0.75rem; color: #a5b4fc; min-width: 60px; text-align: right;
+    }
+    .trace-summary-row {
+        display: flex; gap: 1.2rem; margin-bottom: 0.6rem;
+        flex-wrap: wrap;
+    }
+    .trace-summary-item {
+        background: rgba(30, 27, 75, 0.6);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 8px; padding: 0.5rem 0.9rem; text-align: center;
+    }
+    .trace-summary-item .label { font-size: 0.7rem; color: #a5b4fc; }
+    .trace-summary-item .value { font-size: 1rem; font-weight: 700; color: #e0e7ff; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -401,6 +431,83 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def render_trace_steps(trace_data: dict) -> None:
+    """Render vertical step cards for a pipeline trace."""
+    if not trace_data:
+        return
+
+    steps = trace_data.get("steps", [])
+    total_ms = trace_data.get("total_latency_ms", 0)
+    total_in = trace_data.get("total_tokens_input", 0)
+    total_out = trace_data.get("total_tokens_output", 0)
+    langfuse_url = trace_data.get("langfuse_url", "")
+
+    summary_html = '<div class="trace-summary-row">'
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Total Latency</div>'
+        f'<div class="value">{total_ms:,} ms</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Tokens In</div>'
+        f'<div class="value">{total_in:,}</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Tokens Out</div>'
+        f'<div class="value">{total_out:,}</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Steps</div>'
+        f'<div class="value">{len(steps)}</div></div>'
+    )
+    summary_html += "</div>"
+    st.markdown(summary_html, unsafe_allow_html=True)
+
+    max_ms = max((s.get("latency_ms", 0) for s in steps), default=1) or 1
+    step_colors = {
+        "query_planner": "#6366f1",
+        "retrieval_planner": "#8b5cf6",
+        "information_retriever": "#22d3ee",
+        "context_assembler": "#10b981",
+        "generator": "#f59e0b",
+        "response_qa": "#ef4444",
+    }
+
+    for step in steps:
+        name = step.get("step_name", "unknown")
+        ms = step.get("latency_ms", 0)
+        tok_in = step.get("tokens_input", 0)
+        tok_out = step.get("tokens_output", 0)
+        bar_pct = min(int(ms / max_ms * 100), 100) if max_ms else 0
+        color = step_colors.get(name, "#6366f1")
+
+        display_name = name.replace("_", " ").title()
+        tokens_str = ""
+        if tok_in or tok_out:
+            tokens_str = f" · {tok_in}/{tok_out} tok"
+
+        st.markdown(
+            f'<div class="trace-card">'
+            f'<span class="step-name" style="color:{color}">{display_name}</span>'
+            f'<div class="trace-bar-bg">'
+            f'<div class="trace-bar-fill" style="width:{bar_pct}%;background:{color};"></div>'
+            f'</div>'
+            f'<span class="trace-stat">{ms:,} ms{tokens_str}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    if langfuse_url:
+        st.markdown(
+            f'<a href="{langfuse_url}" target="_blank" '
+            f'style="font-size:0.8rem; color:#a5b4fc;">View full trace in Langfuse</a>',
+            unsafe_allow_html=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main application entry point
 # ---------------------------------------------------------------------------
@@ -424,6 +531,7 @@ views = [
     "👥 Customer Demographics",
     "🔬 Advanced Analytics",
     "🤖 AI Assistant",
+    "📡 Observability",
 ]
 view = st.sidebar.radio("Navigation", views, label_visibility="collapsed")
 
@@ -1089,6 +1197,7 @@ elif view == "🤖 AI Assistant":
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
+                trace_data = None
                 try:
                     agent_result = None
                     consecutive_failures = st.session_state.get(
@@ -1105,6 +1214,10 @@ elif view == "🤖 AI Assistant":
                             status.write("Searching data sources...")
                             status.write("Generating and quality-checking response...")
                             start = time.perf_counter()
+                            collector = make_trace_collector(agent_settings)
+                            invoke_config = {}
+                            if collector is not None:
+                                invoke_config = {"callbacks": [collector]}
                             try:
                                 agent_result = agent_graph.invoke(
                                     {
@@ -1112,7 +1225,8 @@ elif view == "🤖 AI Assistant":
                                         "messages": st.session_state.messages,
                                         "retry_count": 0,
                                         "trace_steps": [],
-                                    }
+                                    },
+                                    config=invoke_config,
                                 )
                                 st.session_state.agent_consecutive_failures = 0
                                 logger.info(
@@ -1134,6 +1248,16 @@ elif view == "🤖 AI Assistant":
                                         "error": str(agent_err),
                                     })
                                 )
+                                if collector is not None:
+                                    try:
+                                        collector.finalize(
+                                            query=prompt,
+                                            response=str(agent_err),
+                                            status="error",
+                                            session_id=st.session_state.get("_session_id", ""),
+                                        )
+                                    except Exception:
+                                        pass
                                 raise
                             status.update(label="Agent workflow complete", state="complete")
 
@@ -1142,24 +1266,47 @@ elif view == "🤖 AI Assistant":
                             "generated_response", "I could not generate a response."
                         )
                         score = agent_result.get("evaluation", {}).get("score")
+
+                        if collector is not None:
+                            try:
+                                trace_data = collector.finalize(
+                                    query=prompt,
+                                    response=response,
+                                    status="success",
+                                    quality_score=float(score) if score is not None else None,
+                                    session_id=st.session_state.get("_session_id", ""),
+                                )
+                            except Exception:
+                                logger.debug("Trace persistence failed", exc_info=True)
+
                         if score is not None:
                             st.caption(f"Quality score: **{score}/10**")
 
-                        with st.expander("Agent Reasoning"):
-                            st.write("Nodes:", " -> ".join(agent_result.get("trace_steps", [])))
+                        st.markdown(response)
+
+                        with st.expander("Pipeline Trace", expanded=False):
+                            if trace_data and trace_data.get("steps"):
+                                render_trace_steps(trace_data)
+                            else:
+                                st.write(
+                                    "Nodes:",
+                                    " -> ".join(agent_result.get("trace_steps", [])),
+                                )
                             st.write("Safety:", agent_result.get("safety_check", {}))
                             st.write(
                                 "Retrieval strategy:",
                                 agent_result.get("retrieval_strategy", {}),
                             )
                             st.write("Evaluation:", agent_result.get("evaluation", {}))
+
                     elif fallback_rag is not None:
                         llm, vectorstore = fallback_rag
                         response = run_basic_rag(prompt, llm, vectorstore)
+                        st.markdown(response)
                     else:
                         response = "AI assistant is temporarily unavailable."
+                        st.markdown(response)
 
-                    st.markdown(response)
                 except Exception:
                     logger.exception("Agent pipeline failed; trying fallback chain")
                     if fallback_rag is not None:
@@ -1184,6 +1331,236 @@ elif view == "🤖 AI Assistant":
             st.session_state.messages.append(
                 {"role": "assistant", "content": response},
             )
+
+# ──────────────────────── OBSERVABILITY ────────────────────────
+
+elif view == "📡 Observability":
+    render_section_header("Observability Dashboard")
+
+    db_url = agent_settings.database_url
+    _obs_available = True
+    try:
+        from insightforge.observability.repository import (
+            get_latency_metrics,
+            get_quality_metrics,
+            get_steps_dataframe,
+            get_traces_dataframe,
+            get_usage_metrics,
+        )
+    except ImportError:
+        _obs_available = False
+
+    if not _obs_available or not db_url:
+        st.warning(
+            "Observability requires a DATABASE_URL and the observability "
+            "dependencies (sqlalchemy, psycopg2-binary). Run `alembic upgrade head` "
+            "after starting Postgres to create the trace tables."
+        )
+    else:
+        days = st.selectbox("Time window", [7, 14, 30, 90], index=2)
+
+        traces_df = get_traces_dataframe(db_url, days=days)
+        steps_df = get_steps_dataframe(db_url, days=days)
+
+        if traces_df.empty:
+            st.info(
+                "No traces recorded yet. Ask a question in the AI Assistant to "
+                "start collecting data."
+            )
+        else:
+            # ── Latency KPIs ──
+            latency = get_latency_metrics(db_url, days=days)
+            quality = get_quality_metrics(db_url, days=days)
+            usage = get_usage_metrics(db_url, days=days)
+
+            kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+            with kc1:
+                render_metric("Total Queries", f"{latency['count']:,}")
+            with kc2:
+                render_metric("Avg Latency", f"{latency['avg']:,.0f} ms")
+            with kc3:
+                render_metric("P95 Latency", f"{latency['p95']:,} ms")
+            with kc4:
+                q_score = quality.get("avg_quality")
+                render_metric(
+                    "Avg Quality",
+                    f"{q_score:.1f}/10" if q_score else "N/A",
+                )
+            with kc5:
+                render_metric("Error Rate", f"{quality['error_rate']:.1f}%")
+
+            st.markdown("")
+
+            tab_lat, tab_qual, tab_usage, tab_traces = st.tabs(
+                ["Latency", "Quality", "Usage", "Trace Log"],
+            )
+
+            # ── Latency tab ──
+            with tab_lat:
+                st.markdown("#### Latency by Pipeline Stage")
+                breakdown = latency.get("step_breakdown", [])
+                if breakdown:
+                    bd_df = pd.DataFrame(breakdown)
+                    fig = px.bar(
+                        bd_df, x="step", y="avg_ms",
+                        color_discrete_sequence=COLORS,
+                        text_auto=",.0f",
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Pipeline Stage",
+                        yaxis_title="Avg Latency (ms)",
+                    )
+                    fig.update_traces(textposition="outside")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("#### Latency Over Time")
+                if not traces_df.empty and "created_at" in traces_df.columns:
+                    fig = px.scatter(
+                        traces_df, x="created_at", y="total_latency_ms",
+                        color="status",
+                        color_discrete_sequence=COLORS,
+                        hover_data=["query"],
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Latency (ms)",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                if not steps_df.empty:
+                    st.markdown("#### Per-Step Latency Distribution")
+                    fig = px.box(
+                        steps_df, x="step_name", y="latency_ms",
+                        color="step_name", color_discrete_sequence=COLORS,
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=400,
+                        showlegend=False,
+                        xaxis_title="Step", yaxis_title="Latency (ms)",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # ── Quality tab ──
+            with tab_qual:
+                qc1, qc2, qc3 = st.columns(3)
+                with qc1:
+                    render_metric(
+                        "Avg Quality Score",
+                        f"{quality['avg_quality']:.1f}/10" if quality["avg_quality"] else "N/A",
+                    )
+                with qc2:
+                    render_metric("Fallback Rate", f"{quality['fallback_rate']:.1f}%")
+                with qc3:
+                    render_metric("Error Rate", f"{quality['error_rate']:.1f}%")
+
+                st.markdown("#### Quality Score Over Time")
+                scored = traces_df.dropna(subset=["quality_score"])
+                if not scored.empty:
+                    fig = px.scatter(
+                        scored, x="created_at", y="quality_score",
+                        color_discrete_sequence=["#10b981"],
+                        hover_data=["query"],
+                    )
+                    fig.add_hline(
+                        y=scored["quality_score"].mean(),
+                        line_dash="dash", line_color="#f59e0b",
+                        annotation_text=f"Avg: {scored['quality_score'].mean():.1f}",
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Quality Score",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No quality scores recorded yet.")
+
+                st.markdown("#### Status Distribution")
+                status_counts = traces_df["status"].value_counts().reset_index()
+                status_counts.columns = ["status", "count"]
+                fig = px.pie(
+                    status_counts, names="status", values="count",
+                    color_discrete_sequence=COLORS, hole=0.4,
+                )
+                fig.update_layout(template=CHART_TEMPLATE, height=350)
+                st.plotly_chart(fig, use_container_width=True)
+
+            # ── Usage tab ──
+            with tab_usage:
+                uc1, uc2, uc3 = st.columns(3)
+                with uc1:
+                    render_metric(
+                        "Total Tokens In",
+                        f"{usage['total_tokens_input']:,}",
+                    )
+                with uc2:
+                    render_metric(
+                        "Total Tokens Out",
+                        f"{usage['total_tokens_output']:,}",
+                    )
+                with uc3:
+                    total_tok = usage["total_tokens_input"] + usage["total_tokens_output"]
+                    render_metric("Total Tokens", f"{total_tok:,}")
+
+                st.markdown("#### Token Usage Over Time")
+                if not traces_df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=traces_df["created_at"],
+                        y=traces_df["total_tokens_input"],
+                        mode="lines+markers", name="Input",
+                        line={"color": "#6366f1"},
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=traces_df["created_at"],
+                        y=traces_df["total_tokens_output"],
+                        mode="lines+markers", name="Output",
+                        line={"color": "#22d3ee"},
+                    ))
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Tokens",
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                tool_usage = usage.get("tool_usage", {})
+                if tool_usage:
+                    st.markdown("#### Pipeline Stage Frequency")
+                    tu_df = pd.DataFrame(
+                        list(tool_usage.items()),
+                        columns=["stage", "count"],
+                    )
+                    fig = px.pie(
+                        tu_df, names="stage", values="count",
+                        color_discrete_sequence=COLORS, hole=0.4,
+                    )
+                    fig.update_layout(template=CHART_TEMPLATE, height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # ── Trace Log tab ──
+            with tab_traces:
+                st.markdown("#### Recent Traces")
+                display_df = traces_df[
+                    ["created_at", "query", "status", "total_latency_ms",
+                     "quality_score", "total_tokens_input", "total_tokens_output"]
+                ].copy()
+                display_df.columns = [
+                    "Time", "Query", "Status", "Latency (ms)",
+                    "Quality", "Tokens In", "Tokens Out",
+                ]
+                st.dataframe(
+                    display_df.sort_values("Time", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=500,
+                )
+
+    if agent_settings.langfuse_host:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(
+            f"[Open Langfuse Dashboard]({agent_settings.langfuse_host})"
+        )
 
 # ──────────────────────── FOOTER ────────────────────────
 
