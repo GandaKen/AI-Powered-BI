@@ -9,7 +9,6 @@ import pytest
 
 try:
     from insightforge.agent import create_agent
-    from insightforge.agent.graph import build_agent_graph
     from insightforge.config import Settings
 except ImportError as e:
     pytest.skip(f"Agent imports unavailable: {e}", allow_module_level=True)

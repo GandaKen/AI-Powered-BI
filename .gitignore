@@ -4,6 +4,7 @@ venv/
 # Python artifacts
 __pycache__/
 *.pyc
+.coverage
 
 # Environment variables
 .env

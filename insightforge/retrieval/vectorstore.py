@@ -26,7 +26,7 @@ class VectorStoreManager:
         self.vectorstore: FAISS | None = None
         self._data_hash: str | None = None
 
-    def build(self, documents: list[Document]) -> "VectorStoreManager":
+    def build(self, documents: list[Document]) -> VectorStoreManager:
         self._data_hash = _documents_hash(documents)
         self.vectorstore = FAISS.from_documents(documents, self.embeddings)
         return self
@@ -42,7 +42,7 @@ class VectorStoreManager:
                 json.dumps({"hash": self._data_hash}), encoding="utf-8"
             )
 
-    def load(self, path: str | Path, expected_hash: str | None = None) -> "VectorStoreManager":
+    def load(self, path: str | Path, expected_hash: str | None = None) -> VectorStoreManager:
         path = Path(path)
         self.vectorstore = FAISS.load_local(
             str(path),

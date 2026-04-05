@@ -42,8 +42,8 @@ def sample_df():
 
 def test_chat_flow_query_to_response(mock_settings, sample_df):
     """Simulate chat: query -> agent invoke -> response in state."""
-    from langchain_core.tools import tool
     from langchain_community.embeddings import FakeEmbeddings
+    from langchain_core.tools import tool
 
     def _mock_search(query: str) -> str:
         """Mock vector search."""

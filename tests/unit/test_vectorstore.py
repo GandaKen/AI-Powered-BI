@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from insightforge.retrieval.documents import build_documents
 from insightforge.retrieval.vectorstore import (
     VectorStoreManager,

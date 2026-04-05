@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from insightforge.prompts.templates import RESPONSE_QA_PROMPT
+
+logger = logging.getLogger(__name__)
+
+_HEURISTIC_PASS_THRESHOLD = 7
 
 
 def _heuristic_score(response: str) -> tuple[int, list[str]]:
@@ -20,7 +25,12 @@ def _heuristic_score(response: str) -> tuple[int, list[str]]:
 
 
 def make_response_qa_node(llm, settings):
-    """Create response QA node with at most one retry."""
+    """Create response QA node with at most one retry.
+
+    When the fast heuristic already scores >= ``_HEURISTIC_PASS_THRESHOLD``
+    the expensive LLM evaluation call is skipped entirely, saving a full
+    round-trip to the heavy model.
+    """
 
     def _node(state: dict) -> dict:
         trace_steps = list(state.get("trace_steps", []))
@@ -28,21 +38,22 @@ def make_response_qa_node(llm, settings):
 
         response = state.get("generated_response", "")
         score, issues = _heuristic_score(response)
-
         refined = response
-        try:
-            raw = llm.invoke(
-                RESPONSE_QA_PROMPT.format(
-                    question=state.get("query", ""),
-                    response=response,
-                )
-            ).content
-            parsed = json.loads(raw) if isinstance(raw, str) else {}
-            refined = parsed.get("refined_response", response)
-            score = int(parsed.get("score", score))
-            issues = parsed.get("issues", issues)
-        except Exception:
-            pass
+
+        if score < _HEURISTIC_PASS_THRESHOLD:
+            try:
+                raw = llm.invoke(
+                    RESPONSE_QA_PROMPT.format(
+                        question=state.get("query", ""),
+                        response=response,
+                    )
+                ).content
+                parsed = json.loads(raw) if isinstance(raw, str) else {}
+                refined = parsed.get("refined_response", response)
+                score = int(parsed.get("score", score))
+                issues = parsed.get("issues", issues)
+            except Exception:
+                logger.warning("Failed to parse QA evaluation", exc_info=True)
 
         retry_count = state.get("retry_count", 0)
         needs_retry = score < 7 and retry_count < settings.max_eval_retries

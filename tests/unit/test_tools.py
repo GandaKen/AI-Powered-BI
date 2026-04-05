@@ -10,8 +10,6 @@ import pytest
 from insightforge.agent.tools.data_analysis import build_data_analysis_tool
 from insightforge.agent.tools.statistical import build_statistical_tool
 from insightforge.agent.tools.vector_search import build_vector_search_tool
-from insightforge.retrieval.documents import build_documents
-from insightforge.retrieval.vectorstore import VectorStoreManager
 
 
 def test_vector_search_tool() -> None:

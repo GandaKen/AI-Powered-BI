@@ -33,7 +33,7 @@ def build_agent_graph(
     workflow.add_node("information_retriever", make_information_retriever_node(tool_registry))
     workflow.add_node("context_assembler", make_context_assembler_node(settings))
     workflow.add_node("generator", make_generator_node(llm_heavy))
-    workflow.add_node("response_qa", make_response_qa_node(llm_heavy, settings))
+    workflow.add_node("response_qa", make_response_qa_node(llm_light, settings))
 
     workflow.add_edge(START, "query_planner")
     workflow.add_edge("query_planner", "retrieval_planner")

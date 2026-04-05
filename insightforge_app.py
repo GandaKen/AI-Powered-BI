@@ -196,10 +196,11 @@ def initialize_rag_system(_df: pd.DataFrame):
     """
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
-    from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-    llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    from insightforge.llm.provider import get_embeddings, get_llm
+
+    llm = get_llm(agent_settings, tier="light")
+    embeddings = get_embeddings(agent_settings)
 
     documents: list[Document] = []
     total_sales = _df["Sales"].sum()

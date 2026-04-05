@@ -235,28 +235,39 @@ cp .env.example .env            # then edit .env as needed
 
 ### Running the App
 
-**Local (direct Ollama):**
+**Docker Compose (default):**
+
+```bash
+make                  # builds and starts the full stack (Ollama + Bifrost + Postgres + Redis + App)
+```
+
+This is equivalent to `docker compose up --build -d`. The app is available at
+[http://localhost:8501](http://localhost:8501) once all services are healthy. The
+first run pulls Ollama models via an init container.
+
+**Other Makefile targets:**
+
+```bash
+make up               # same as bare `make` — start the full stack
+make down             # stop the full stack
+make logs             # tail logs from all services
+make status           # show status of all services
+make restart          # restart only the app container
+make build            # rebuild the app image without starting
+make db-migrate       # run Alembic migrations
+make install          # install Python dependencies locally
+make help             # show all available targets
+```
+
+**Local development (without Docker):**
 
 ```bash
 # Start Ollama in a separate terminal
 ollama serve
 
 # Launch the Streamlit dashboard
-streamlit run insightforge_app.py
+make dev
 ```
-
-**Using the Makefile:**
-
-```bash
-make dev              # Start Streamlit in dev mode
-make docker-up        # Start the full Docker Compose stack
-make docker-down      # Stop the stack
-make db-migrate       # Run Alembic migrations
-make install          # Install all dependencies
-make help             # Show all available targets
-```
-
-Then open [http://localhost:8501](http://localhost:8501).
 
 ---
 

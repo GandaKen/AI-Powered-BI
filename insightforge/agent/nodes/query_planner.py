@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from insightforge.prompts.templates import QUERY_PLANNER_PROMPT
+
+logger = logging.getLogger(__name__)
 
 
 def make_query_planner_node(llm, guardrail):
@@ -27,7 +30,7 @@ def make_query_planner_node(llm, guardrail):
                 raw = llm.invoke(QUERY_PLANNER_PROMPT.format(query=query)).content
                 query_plan = json.loads(raw) if isinstance(raw, str) else query_plan
             except Exception:
-                pass
+                logger.warning("Failed to parse query plan for: %s", query[:80], exc_info=True)
 
         return {
             "safety_check": {"label": safety.label, "reason": safety.reason},

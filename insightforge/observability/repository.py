@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import case, cast, func, Float as SAFloat
+from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
 from insightforge.db.connection import get_session
@@ -54,7 +54,7 @@ def get_trace_by_id(database_url: str, trace_id: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 def _since(days: int = 30) -> datetime:
-    return datetime.now(timezone.utc) - timedelta(days=days)
+    return datetime.now(UTC) - timedelta(days=days)
 
 
 def get_latency_metrics(database_url: str, days: int = 30) -> dict[str, Any]:

@@ -70,9 +70,9 @@ class TraceCollector(BaseCallbackHandler):
     # -- chain events (LangGraph nodes fire as chains) -----------------------
 
     def on_chain_start(
-        self, serialized: dict[str, Any], inputs: dict[str, Any], *, run_id, **kwargs
+        self, serialized: dict[str, Any] | None, inputs: dict[str, Any] | None, *, run_id, **kwargs
     ) -> None:
-        name = serialized.get("name", "").lower()
+        name = (serialized or {}).get("name", "").lower()
         if name in PIPELINE_NODES:
             info = _RunInfo(name, "chain")
             self._runs[run_id] = info
@@ -119,8 +119,8 @@ class TraceCollector(BaseCallbackHandler):
 
     # -- LLM events (token tracking) -----------------------------------------
 
-    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], *, run_id, **kwargs) -> None:
-        self._runs[run_id] = _RunInfo(serialized.get("name", "llm"), "llm")
+    def on_llm_start(self, serialized: dict[str, Any] | None, prompts: list[str], *, run_id, **kwargs) -> None:
+        self._runs[run_id] = _RunInfo((serialized or {}).get("name", "llm"), "llm")
 
     def on_llm_end(self, response: LLMResult, *, run_id, **kwargs) -> None:
         llm_info = self._runs.pop(run_id, None)
@@ -138,8 +138,8 @@ class TraceCollector(BaseCallbackHandler):
 
     # -- tool events ----------------------------------------------------------
 
-    def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id, **kwargs) -> None:
-        self._runs[run_id] = _RunInfo(serialized.get("name", "tool"), "tool")
+    def on_tool_start(self, serialized: dict[str, Any] | None, input_str: str, *, run_id, **kwargs) -> None:
+        self._runs[run_id] = _RunInfo((serialized or {}).get("name", "tool"), "tool")
 
     def on_tool_end(self, output: str, *, run_id, **kwargs) -> None:
         self._runs.pop(run_id, None)
