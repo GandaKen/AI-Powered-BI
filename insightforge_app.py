@@ -532,6 +532,7 @@ views = [
     "👥 Customer Demographics",
     "🔬 Advanced Analytics",
     "🤖 AI Assistant",
+    "📋 Model Evaluation",
     "📡 Observability",
 ]
 view = st.sidebar.radio("Navigation", views, label_visibility="collapsed")
@@ -1332,6 +1333,195 @@ elif view == "🤖 AI Assistant":
             st.session_state.messages.append(
                 {"role": "assistant", "content": response},
             )
+
+# ──────────────────────── MODEL EVALUATION ─────────────────────
+
+elif view == "📋 Model Evaluation":
+    render_section_header("Model Evaluation — QAEvalChain")
+
+    st.markdown(
+        "Run the agentic RAG pipeline against **data-derived ground-truth Q&A pairs** "
+        "and grade each answer using LangChain's `QAEvalChain`. This mirrors the notebook "
+        "evaluation (Step 7a) but runs against the production agent."
+    )
+
+    from insightforge.evaluation.qa_eval import build_eval_qa_pairs, run_qa_evaluation
+    from insightforge.llm.provider import get_llm as _get_eval_llm
+
+    qa_pairs = build_eval_qa_pairs(df_raw)
+
+    with st.expander("Ground-Truth Q&A Pairs", expanded=False):
+        for idx, pair in enumerate(qa_pairs, 1):
+            st.markdown(
+                f"**Q{idx}.** {pair['question']}\n\n"
+                f"> **Expected:** {pair['answer']}"
+            )
+            st.markdown("---")
+
+    eval_col1, eval_col2 = st.columns([1, 3])
+    with eval_col1:
+        n_questions = st.selectbox(
+            "Questions to run",
+            options=[5, 10, len(qa_pairs)],
+            format_func=lambda x: f"All ({x})" if x == len(qa_pairs) else str(x),
+            index=0,
+        )
+        use_agent = st.toggle("Use agentic pipeline", value=True)
+
+    with eval_col2:
+        st.caption(
+            "**Agentic pipeline** sends each question through the full 6-node graph. "
+            "**Basic RAG** uses the simpler retriever + LLM chain. "
+            "The evaluation LLM grades each prediction against the ground-truth answer."
+        )
+
+    if st.button("Run Evaluation", type="primary", use_container_width=True):
+        selected_pairs = qa_pairs[:n_questions]
+
+        agent_graph = None
+        fallback_rag = None
+        eval_error = False
+
+        if use_agent:
+            try:
+                agent_graph = initialize_agent_system(df_raw)
+            except Exception:
+                logger.exception("Agent init failed for eval; falling back to basic RAG")
+
+        if agent_graph is None or not use_agent:
+            try:
+                fallback_rag = initialize_rag_system(df_raw)
+            except Exception:
+                logger.exception("Fallback RAG init also failed for eval")
+                st.error(
+                    "Could not initialise the AI system for evaluation. "
+                    "Make sure Ollama is running with the required models."
+                )
+                eval_error = True
+
+        if not eval_error and (agent_graph is not None or fallback_rag is not None):
+            def _predict(question: str) -> str:
+                if agent_graph is not None and use_agent:
+                    result = agent_graph.invoke({
+                        "query": question,
+                        "messages": [],
+                        "retry_count": 0,
+                        "trace_steps": [],
+                    })
+                    return (
+                        result.get("final_response")
+                        or result.get("generated_response", "")
+                    )
+                llm_fb, vs_fb = fallback_rag
+                return run_basic_rag(question, llm_fb, vs_fb)
+
+            progress_bar = st.progress(0, text="Starting evaluation...")
+            status_text = st.empty()
+
+            def _progress(current: int, total: int, question: str) -> None:
+                pct = int((current / total) * 100)
+                progress_bar.progress(pct, text=f"Q{current + 1}/{total}")
+                status_text.caption(f"Asking: *{question}*")
+
+            eval_llm = _get_eval_llm(agent_settings, tier="light")
+
+            with st.spinner("Running evaluation — this may take a few minutes..."):
+                eval_results = run_qa_evaluation(
+                    selected_pairs,
+                    _predict,
+                    eval_llm,
+                    progress_callback=_progress,
+                )
+
+            progress_bar.progress(100, text="Evaluation complete!")
+            status_text.empty()
+
+            st.session_state["last_eval_results"] = eval_results
+            st.session_state["last_eval_mode"] = "Agent" if (agent_graph and use_agent) else "Basic RAG"
+
+    if "last_eval_results" in st.session_state:
+        eval_results = st.session_state["last_eval_results"]
+        eval_mode = st.session_state.get("last_eval_mode", "Agent")
+        predictions = eval_results["predictions"]
+        accuracy = eval_results["accuracy"]
+        correct = eval_results["correct"]
+        total = eval_results["total"]
+
+        st.markdown("")
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        with kc1:
+            render_metric("Pipeline", eval_mode)
+        with kc2:
+            render_metric("Accuracy", f"{accuracy:.1f}%")
+        with kc3:
+            render_metric("Correct", f"{correct}/{total}")
+        with kc4:
+            grade_map = {"correct": 0, "incorrect": 0}
+            for p in predictions:
+                key = "correct" if p["is_correct"] else "incorrect"
+                grade_map[key] += 1
+            render_metric("Incorrect", str(grade_map["incorrect"]))
+
+        st.markdown("")
+
+        tab_detail, tab_chart = st.tabs(["Detailed Results", "Summary Charts"])
+
+        with tab_detail:
+            for idx, pred in enumerate(predictions, 1):
+                icon = "✅" if pred["is_correct"] else "❌"
+                with st.expander(f"{icon} Q{idx}: {pred['question']}", expanded=not pred["is_correct"]):
+                    st.markdown(f"**Expected Answer:**\n> {pred['expected']}")
+                    st.markdown(f"**Model Prediction:**\n> {pred['predicted']}")
+                    st.markdown(f"**Grade:** `{pred['grade']}`")
+
+        with tab_chart:
+            results_df = pd.DataFrame(predictions)
+
+            chart_c1, chart_c2 = st.columns(2)
+            with chart_c1:
+                grade_counts = results_df["is_correct"].value_counts().reset_index()
+                grade_counts.columns = ["is_correct", "count"]
+                grade_counts["label"] = grade_counts["is_correct"].map(
+                    {True: "Correct", False: "Incorrect"}
+                )
+                fig = px.pie(
+                    grade_counts,
+                    names="label",
+                    values="count",
+                    color="label",
+                    color_discrete_map={"Correct": "#10b981", "Incorrect": "#ef4444"},
+                    hole=0.4,
+                    title="Pass / Fail Distribution",
+                )
+                fig.update_layout(template=CHART_TEMPLATE, height=350)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with chart_c2:
+                results_df["status"] = results_df["is_correct"].map(
+                    {True: "Correct", False: "Incorrect"}
+                )
+                results_df["q_label"] = [f"Q{i+1}" for i in range(len(results_df))]
+                fig = px.bar(
+                    results_df,
+                    x="q_label",
+                    y=[1] * len(results_df),
+                    color="status",
+                    color_discrete_map={"Correct": "#10b981", "Incorrect": "#ef4444"},
+                    title="Per-Question Results",
+                )
+                fig.update_layout(
+                    template=CHART_TEMPLATE, height=350,
+                    xaxis_title="Question", yaxis_title="",
+                    yaxis={"visible": False},
+                    showlegend=True,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Results Table")
+            display = results_df[["question", "is_correct", "grade"]].copy()
+            display.columns = ["Question", "Correct", "Grade"]
+            display.insert(0, "#", range(1, len(display) + 1))
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
 # ──────────────────────── OBSERVABILITY ────────────────────────
 

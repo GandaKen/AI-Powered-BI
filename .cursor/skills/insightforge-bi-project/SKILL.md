@@ -37,6 +37,7 @@ Derived columns added at load time: `Month`, `Quarter`, `Year`, `DayOfWeek`, `Ag
 4. **Customer Demographics** — Age histogram, gender comparison, age group bars, scatter (age vs sales vs satisfaction), gender×product
 5. **Advanced Analytics** — Correlation matrix, scatter matrix, violin plots, time decomposition (subplots), segmentation bubble chart, top/bottom segments
 6. **AI Assistant** — RAG-powered chat using Ollama + LangChain
+7. **Model Evaluation** — QAEvalChain with data-derived ground-truth Q&A pairs
 
 ### Key Conventions
 - Color palette: `COLORS`, `PRODUCT_COLORS`, `REGION_COLORS` constants at top
