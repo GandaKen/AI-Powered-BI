@@ -49,4 +49,3 @@ def build_statistical_tool(df: pd.DataFrame):
         return "Unsupported statistical operation."
 
     return statistical
-

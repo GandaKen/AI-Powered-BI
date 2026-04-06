@@ -30,4 +30,3 @@ def test_settings_validate_url(monkeypatch) -> None:
     monkeypatch.setenv("BIFROST_BASE_URL", "invalid")
     with pytest.raises(ValueError, match="http"):
         Settings()
-

@@ -64,4 +64,3 @@ def make_generator_node(llm):
         }
 
     return _node
-

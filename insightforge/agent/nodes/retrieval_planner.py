@@ -43,4 +43,3 @@ def make_retrieval_planner_node():
         }
 
     return _node
-

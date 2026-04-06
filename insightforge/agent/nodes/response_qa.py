@@ -71,4 +71,3 @@ def make_response_qa_node(llm, settings):
         }
 
     return _node
-

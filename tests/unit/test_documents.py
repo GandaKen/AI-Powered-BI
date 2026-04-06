@@ -10,4 +10,3 @@ def test_build_documents_returns_multiple_types(sample_df) -> None:
     assert "overview" in types
     assert "product" in types
     assert "region" in types
-

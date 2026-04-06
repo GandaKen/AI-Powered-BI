@@ -44,4 +44,3 @@ def make_context_assembler_node(settings):
         }
 
     return _node
-

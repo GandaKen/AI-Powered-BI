@@ -40,4 +40,3 @@ def make_query_planner_node(llm, guardrail):
         }
 
     return _node
-

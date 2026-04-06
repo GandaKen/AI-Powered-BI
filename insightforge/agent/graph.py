@@ -51,4 +51,3 @@ def build_agent_graph(
     )
 
     return workflow.compile()
-

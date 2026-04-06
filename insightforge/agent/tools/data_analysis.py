@@ -79,4 +79,3 @@ def build_data_analysis_tool(df: pd.DataFrame):
         raise ValueError(f"Unsupported operation: {operation}")
 
     return data_analysis
-

@@ -72,4 +72,3 @@ class QueryGuardrail:
         except Exception:
             logger.debug("LLM guardrail failed; falling back to heuristic pass", exc_info=True)
             return GuardrailResult(label="safe", reason="Guardrail fallback path used.")
-

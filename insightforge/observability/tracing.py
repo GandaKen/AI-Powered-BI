@@ -11,7 +11,7 @@ def get_langfuse_callbacks(settings):
         return []
 
     try:
-        from langfuse.callback import CallbackHandler
+        from langfuse.langchain import CallbackHandler
 
         return [
             CallbackHandler(

@@ -39,4 +39,3 @@ def mock_embeddings():
     """Fake embeddings for tests (768 dims matches nomic-embed-text)."""
     from langchain_community.embeddings import FakeEmbeddings
     return FakeEmbeddings(size=768)
-

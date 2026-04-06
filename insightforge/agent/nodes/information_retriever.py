@@ -41,4 +41,3 @@ def make_information_retriever_node(tool_registry: dict):
         return {"retrieved_chunks": chunks, "trace_steps": trace_steps}
 
     return _node
-

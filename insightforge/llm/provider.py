@@ -97,4 +97,3 @@ def get_embeddings(settings: Settings):
         except Exception:
             logger.warning("Bifrost embeddings construction failed; falling back to direct Ollama")
     return OllamaEmbeddings(model=settings.embedding_model)
-

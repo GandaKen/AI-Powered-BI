@@ -15,4 +15,3 @@ def build_vector_search_tool(vector_manager, top_k: int):
         return "\n\n".join(doc.page_content for doc in docs)
 
     return vector_search
-

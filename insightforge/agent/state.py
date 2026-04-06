@@ -20,4 +20,3 @@ class AgentState(TypedDict, total=False):
     final_response: str
     retry_count: int
     trace_steps: list[str]
-
