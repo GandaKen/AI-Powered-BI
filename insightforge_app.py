@@ -12,8 +12,10 @@ Requirements:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -23,6 +25,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+
+from insightforge.agent import create_agent
+from insightforge.config import settings as agent_settings
+from insightforge.observability.tracing import make_trace_collector
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +42,8 @@ LLM_MODEL: str = "llama3.2:3b"
 EMBEDDING_MODEL: str = "nomic-embed-text"
 LLM_TEMPERATURE: float = 0
 RAG_TOP_K: int = 5
+HEAVY_MODEL: str = agent_settings.llm_model_heavy
+CIRCUIT_BREAKER_THRESHOLD: int = 3
 
 CHART_TEMPLATE: str = "plotly_dark"
 
@@ -82,6 +90,35 @@ st.markdown(
     .metric-card .delta-neg { color: #f87171; font-size: 0.8rem; }
     .section-header { border-left: 4px solid #6366f1; padding-left: 12px; margin: 1.5rem 0 1rem 0; }
     div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+    .trace-card {
+        background: rgba(30, 27, 75, 0.6);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.4rem;
+        display: flex; align-items: center; gap: 0.8rem;
+    }
+    .trace-card .step-name {
+        font-weight: 600; font-size: 0.82rem; color: #e0e7ff;
+        min-width: 150px;
+    }
+    .trace-bar-bg {
+        flex: 1; height: 8px; background: rgba(99, 102, 241, 0.15);
+        border-radius: 4px; overflow: hidden;
+    }
+    .trace-bar-fill { height: 100%; border-radius: 4px; }
+    .trace-stat {
+        font-size: 0.75rem; color: #a5b4fc; min-width: 60px; text-align: right;
+    }
+    .trace-summary-row {
+        display: flex; gap: 1.2rem; margin-bottom: 0.6rem;
+        flex-wrap: wrap;
+    }
+    .trace-summary-item {
+        background: rgba(30, 27, 75, 0.6);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 8px; padding: 0.5rem 0.9rem; text-align: center;
+    }
+    .trace-summary-item .label { font-size: 0.7rem; color: #a5b4fc; }
+    .trace-summary-item .value { font-size: 1rem; font-weight: 700; color: #e0e7ff; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -159,10 +196,11 @@ def initialize_rag_system(_df: pd.DataFrame):
     """
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
-    from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-    llm = ChatOllama(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    from insightforge.llm.provider import get_embeddings, get_llm
+
+    llm = get_llm(agent_settings, tier="light")
+    embeddings = get_embeddings(agent_settings)
 
     documents: list[Document] = []
     total_sales = _df["Sales"].sum()
@@ -280,6 +318,38 @@ def initialize_rag_system(_df: pd.DataFrame):
     return llm, vectorstore
 
 
+@st.cache_resource
+def initialize_agent_system(_df: pd.DataFrame):
+    """Build the LangGraph-based agentic RAG system."""
+    return create_agent(_df, agent_settings)
+
+
+def run_basic_rag(prompt: str, llm, vectorstore) -> str:
+    """Run the legacy chain-based RAG as fallback path."""
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": RAG_TOP_K})
+    docs = retriever.invoke(prompt)
+    context = "\n".join(d.page_content for d in docs)
+
+    template = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are InsightForge, an expert BI analyst. "
+            "Answer questions using ONLY the data context provided. "
+            "Be precise with numbers. Use bullet points for comparisons. "
+            "If the data doesn't contain the answer, say so clearly.",
+        ),
+        (
+            "human",
+            "Data Context:\n{context}\n\nQuestion: {question}",
+        ),
+    ])
+    chain = template | llm | StrOutputParser()
+    return chain.invoke({"context": context, "question": prompt})
+
+
 # ---------------------------------------------------------------------------
 # Reusable UI helpers
 # ---------------------------------------------------------------------------
@@ -362,6 +432,83 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def render_trace_steps(trace_data: dict) -> None:
+    """Render vertical step cards for a pipeline trace."""
+    if not trace_data:
+        return
+
+    steps = trace_data.get("steps", [])
+    total_ms = trace_data.get("total_latency_ms", 0)
+    total_in = trace_data.get("total_tokens_input", 0)
+    total_out = trace_data.get("total_tokens_output", 0)
+    langfuse_url = trace_data.get("langfuse_url", "")
+
+    summary_html = '<div class="trace-summary-row">'
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Total Latency</div>'
+        f'<div class="value">{total_ms:,} ms</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Tokens In</div>'
+        f'<div class="value">{total_in:,}</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Tokens Out</div>'
+        f'<div class="value">{total_out:,}</div></div>'
+    )
+    summary_html += (
+        f'<div class="trace-summary-item">'
+        f'<div class="label">Steps</div>'
+        f'<div class="value">{len(steps)}</div></div>'
+    )
+    summary_html += "</div>"
+    st.markdown(summary_html, unsafe_allow_html=True)
+
+    max_ms = max((s.get("latency_ms", 0) for s in steps), default=1) or 1
+    step_colors = {
+        "query_planner": "#6366f1",
+        "retrieval_planner": "#8b5cf6",
+        "information_retriever": "#22d3ee",
+        "context_assembler": "#10b981",
+        "generator": "#f59e0b",
+        "response_qa": "#ef4444",
+    }
+
+    for step in steps:
+        name = step.get("step_name", "unknown")
+        ms = step.get("latency_ms", 0)
+        tok_in = step.get("tokens_input", 0)
+        tok_out = step.get("tokens_output", 0)
+        bar_pct = min(int(ms / max_ms * 100), 100) if max_ms else 0
+        color = step_colors.get(name, "#6366f1")
+
+        display_name = name.replace("_", " ").title()
+        tokens_str = ""
+        if tok_in or tok_out:
+            tokens_str = f" · {tok_in}/{tok_out} tok"
+
+        st.markdown(
+            f'<div class="trace-card">'
+            f'<span class="step-name" style="color:{color}">{display_name}</span>'
+            f'<div class="trace-bar-bg">'
+            f'<div class="trace-bar-fill" style="width:{bar_pct}%;background:{color};"></div>'
+            f'</div>'
+            f'<span class="trace-stat">{ms:,} ms{tokens_str}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    if langfuse_url:
+        st.markdown(
+            f'<a href="{langfuse_url}" target="_blank" '
+            f'style="font-size:0.8rem; color:#a5b4fc;">View full trace in Langfuse</a>',
+            unsafe_allow_html=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main application entry point
 # ---------------------------------------------------------------------------
@@ -385,6 +532,8 @@ views = [
     "👥 Customer Demographics",
     "🔬 Advanced Analytics",
     "🤖 AI Assistant",
+    "📋 Model Evaluation",
+    "📡 Observability",
 ]
 view = st.sidebar.radio("Navigation", views, label_visibility="collapsed")
 
@@ -995,22 +1144,33 @@ elif view == "🔬 Advanced Analytics":
 elif view == "🤖 AI Assistant":
     render_section_header("Chat with InsightForge")
 
+    agent_graph = None
+    fallback_rag = None
+
     try:
-        with st.spinner("Loading AI models..."):
-            llm, vectorstore = initialize_rag_system(df_raw)
+        with st.spinner("Loading agentic RAG..."):
+            agent_graph = initialize_agent_system(df_raw)
     except Exception:
-        logger.exception("RAG system initialisation failed")
-        st.error(
-            "Could not initialise the AI assistant. "
-            "Make sure Ollama is running with the required models "
-            f"(`{LLM_MODEL}` and `{EMBEDDING_MODEL}`)."
-        )
-        st.stop()
+        logger.exception("Agentic RAG initialization failed; trying fallback chain")
+
+    try:
+        with st.spinner("Loading fallback RAG..."):
+            fallback_rag = initialize_rag_system(df_raw)
+    except Exception:
+        logger.exception("Fallback RAG initialisation failed")
+        if agent_graph is None:
+            st.error(
+                "Could not initialise the AI assistant. "
+                "Make sure Ollama is running with the required models "
+                f"(`{LLM_MODEL}`, `{HEAVY_MODEL}`, and `{EMBEDDING_MODEL}`)."
+            )
+            st.stop()
 
     col1, col2 = st.columns([3, 1])
     with col2:
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.agent_consecutive_failures = 0
             st.rerun()
         st.markdown("**💡 Try asking:**")
         sample_qs = [
@@ -1039,54 +1199,559 @@ elif view == "🤖 AI Assistant":
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
+                trace_data = None
                 try:
-                    with st.spinner("Analyzing data..."):
-                        from langchain_core.output_parsers import (
-                            StrOutputParser,
-                        )
-                        from langchain_core.prompts import ChatPromptTemplate
-
-                        retriever = vectorstore.as_retriever(
-                            search_kwargs={"k": RAG_TOP_K},
-                        )
-                        docs = retriever.invoke(prompt)
-                        context = "\n".join(
-                            d.page_content for d in docs
-                        )
-
-                        template = ChatPromptTemplate.from_messages([
-                            (
-                                "system",
-                                "You are InsightForge, an expert BI analyst. "
-                                "Answer questions using ONLY the data context "
-                                "provided. Be precise with numbers. Use bullet "
-                                "points for comparisons. If the data doesn't "
-                                "contain the answer, say so clearly.",
-                            ),
-                            (
-                                "human",
-                                "Data Context:\n{context}\n\n"
-                                "Question: {question}",
-                            ),
-                        ])
-
-                        chain = template | llm | StrOutputParser()
-                        response = chain.invoke(
-                            {"context": context, "question": prompt},
-                        )
-
-                    st.markdown(response)
-                except Exception:
-                    logger.exception("LLM inference failed")
-                    response = (
-                        "Sorry, I encountered an error while processing your "
-                        "question. Please check that Ollama is running and "
-                        "try again."
+                    agent_result = None
+                    consecutive_failures = st.session_state.get(
+                        "agent_consecutive_failures", 0
                     )
+                    use_agent = (
+                        agent_graph is not None
+                        and consecutive_failures < CIRCUIT_BREAKER_THRESHOLD
+                    )
+                    if use_agent:
+                        with st.status("Running agent workflow...", expanded=False) as status:
+                            status.write("Analyzing query...")
+                            status.write("Planning retrieval...")
+                            status.write("Searching data sources...")
+                            status.write("Generating and quality-checking response...")
+                            start = time.perf_counter()
+                            collector = make_trace_collector(agent_settings)
+                            invoke_config = {}
+                            if collector is not None:
+                                invoke_config = {"callbacks": [collector]}
+                            try:
+                                agent_result = agent_graph.invoke(
+                                    {
+                                        "query": prompt,
+                                        "messages": st.session_state.messages,
+                                        "retry_count": 0,
+                                        "trace_steps": [],
+                                    },
+                                    config=invoke_config,
+                                )
+                                st.session_state.agent_consecutive_failures = 0
+                                logger.info(
+                                    json.dumps({
+                                        "event": "agent_success",
+                                        "latency_ms": (time.perf_counter() - start) * 1000,
+                                        "query_len": len(prompt),
+                                        "trace": agent_result.get("trace_steps", []),
+                                    })
+                                )
+                            except Exception as agent_err:
+                                st.session_state.agent_consecutive_failures = (
+                                    consecutive_failures + 1
+                                )
+                                logger.warning(
+                                    json.dumps({
+                                        "event": "agent_failure",
+                                        "consecutive_failures": st.session_state.agent_consecutive_failures,
+                                        "error": str(agent_err),
+                                    })
+                                )
+                                if collector is not None:
+                                    try:
+                                        collector.finalize(
+                                            query=prompt,
+                                            response=str(agent_err),
+                                            status="error",
+                                            session_id=st.session_state.get("_session_id", ""),
+                                        )
+                                    except Exception:
+                                        pass
+                                raise
+                            status.update(label="Agent workflow complete", state="complete")
+
+                    if agent_result is not None:
+                        response = agent_result.get("final_response") or agent_result.get(
+                            "generated_response", "I could not generate a response."
+                        )
+                        score = agent_result.get("evaluation", {}).get("score")
+
+                        if collector is not None:
+                            try:
+                                trace_data = collector.finalize(
+                                    query=prompt,
+                                    response=response,
+                                    status="success",
+                                    quality_score=float(score) if score is not None else None,
+                                    session_id=st.session_state.get("_session_id", ""),
+                                )
+                            except Exception:
+                                logger.debug("Trace persistence failed", exc_info=True)
+
+                        if score is not None:
+                            st.caption(f"Quality score: **{score}/10**")
+
+                        st.markdown(response)
+
+                        with st.expander("Pipeline Trace", expanded=False):
+                            if trace_data and trace_data.get("steps"):
+                                render_trace_steps(trace_data)
+                            else:
+                                st.write(
+                                    "Nodes:",
+                                    " -> ".join(agent_result.get("trace_steps", [])),
+                                )
+                            st.write("Safety:", agent_result.get("safety_check", {}))
+                            st.write(
+                                "Retrieval strategy:",
+                                agent_result.get("retrieval_strategy", {}),
+                            )
+                            st.write("Evaluation:", agent_result.get("evaluation", {}))
+
+                    elif fallback_rag is not None:
+                        llm, vectorstore = fallback_rag
+                        response = run_basic_rag(prompt, llm, vectorstore)
+                        st.markdown(response)
+                    else:
+                        response = "AI assistant is temporarily unavailable."
+                        st.markdown(response)
+
+                except Exception:
+                    logger.exception("Agent pipeline failed; trying fallback chain")
+                    if fallback_rag is not None:
+                        try:
+                            llm, vectorstore = fallback_rag
+                            response = run_basic_rag(prompt, llm, vectorstore)
+                            st.info("Used fallback RAG path due to agent runtime error.")
+                        except Exception:
+                            logger.exception("Fallback chain also failed")
+                            response = (
+                                "Sorry, I encountered an error while processing your "
+                                "question. Please check that Ollama is running and "
+                                "try again."
+                            )
+                    else:
+                        response = (
+                            "Sorry, I encountered an error while processing your "
+                            "question. Please check that Ollama is running and "
+                            "try again."
+                        )
                     st.error(response)
             st.session_state.messages.append(
                 {"role": "assistant", "content": response},
             )
+
+# ──────────────────────── MODEL EVALUATION ─────────────────────
+
+elif view == "📋 Model Evaluation":
+    render_section_header("Model Evaluation — QAEvalChain")
+
+    st.markdown(
+        "Run the agentic RAG pipeline against **data-derived ground-truth Q&A pairs** "
+        "and grade each answer using LangChain's `QAEvalChain`. This mirrors the notebook "
+        "evaluation (Step 7a) but runs against the production agent."
+    )
+
+    from insightforge.evaluation.qa_eval import build_eval_qa_pairs, run_qa_evaluation
+    from insightforge.llm.provider import get_llm as _get_eval_llm
+
+    qa_pairs = build_eval_qa_pairs(df_raw)
+
+    with st.expander("Ground-Truth Q&A Pairs", expanded=False):
+        for idx, pair in enumerate(qa_pairs, 1):
+            st.markdown(
+                f"**Q{idx}.** {pair['question']}\n\n"
+                f"> **Expected:** {pair['answer']}"
+            )
+            st.markdown("---")
+
+    eval_col1, eval_col2 = st.columns([1, 3])
+    with eval_col1:
+        n_questions = st.selectbox(
+            "Questions to run",
+            options=[5, 10, len(qa_pairs)],
+            format_func=lambda x: f"All ({x})" if x == len(qa_pairs) else str(x),
+            index=0,
+        )
+        use_agent = st.toggle("Use agentic pipeline", value=True)
+
+    with eval_col2:
+        st.caption(
+            "**Agentic pipeline** sends each question through the full 6-node graph. "
+            "**Basic RAG** uses the simpler retriever + LLM chain. "
+            "The evaluation LLM grades each prediction against the ground-truth answer."
+        )
+
+    if st.button("Run Evaluation", type="primary", use_container_width=True):
+        selected_pairs = qa_pairs[:n_questions]
+
+        agent_graph = None
+        fallback_rag = None
+        eval_error = False
+
+        if use_agent:
+            try:
+                agent_graph = initialize_agent_system(df_raw)
+            except Exception:
+                logger.exception("Agent init failed for eval; falling back to basic RAG")
+
+        if agent_graph is None or not use_agent:
+            try:
+                fallback_rag = initialize_rag_system(df_raw)
+            except Exception:
+                logger.exception("Fallback RAG init also failed for eval")
+                st.error(
+                    "Could not initialise the AI system for evaluation. "
+                    "Make sure Ollama is running with the required models."
+                )
+                eval_error = True
+
+        if not eval_error and (agent_graph is not None or fallback_rag is not None):
+            def _predict(question: str) -> str:
+                if agent_graph is not None and use_agent:
+                    result = agent_graph.invoke({
+                        "query": question,
+                        "messages": [],
+                        "retry_count": 0,
+                        "trace_steps": [],
+                    })
+                    return (
+                        result.get("final_response")
+                        or result.get("generated_response", "")
+                    )
+                llm_fb, vs_fb = fallback_rag
+                return run_basic_rag(question, llm_fb, vs_fb)
+
+            progress_bar = st.progress(0, text="Starting evaluation...")
+            status_text = st.empty()
+
+            def _progress(current: int, total: int, question: str) -> None:
+                pct = int((current / total) * 100)
+                progress_bar.progress(pct, text=f"Q{current + 1}/{total}")
+                status_text.caption(f"Asking: *{question}*")
+
+            eval_llm = _get_eval_llm(agent_settings, tier="light")
+
+            with st.spinner("Running evaluation — this may take a few minutes..."):
+                eval_results = run_qa_evaluation(
+                    selected_pairs,
+                    _predict,
+                    eval_llm,
+                    progress_callback=_progress,
+                )
+
+            progress_bar.progress(100, text="Evaluation complete!")
+            status_text.empty()
+
+            st.session_state["last_eval_results"] = eval_results
+            st.session_state["last_eval_mode"] = "Agent" if (agent_graph and use_agent) else "Basic RAG"
+
+    if "last_eval_results" in st.session_state:
+        eval_results = st.session_state["last_eval_results"]
+        eval_mode = st.session_state.get("last_eval_mode", "Agent")
+        predictions = eval_results["predictions"]
+        accuracy = eval_results["accuracy"]
+        correct = eval_results["correct"]
+        total = eval_results["total"]
+
+        st.markdown("")
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        with kc1:
+            render_metric("Pipeline", eval_mode)
+        with kc2:
+            render_metric("Accuracy", f"{accuracy:.1f}%")
+        with kc3:
+            render_metric("Correct", f"{correct}/{total}")
+        with kc4:
+            grade_map = {"correct": 0, "incorrect": 0}
+            for p in predictions:
+                key = "correct" if p["is_correct"] else "incorrect"
+                grade_map[key] += 1
+            render_metric("Incorrect", str(grade_map["incorrect"]))
+
+        st.markdown("")
+
+        tab_detail, tab_chart = st.tabs(["Detailed Results", "Summary Charts"])
+
+        with tab_detail:
+            for idx, pred in enumerate(predictions, 1):
+                icon = "✅" if pred["is_correct"] else "❌"
+                with st.expander(f"{icon} Q{idx}: {pred['question']}", expanded=not pred["is_correct"]):
+                    st.markdown(f"**Expected Answer:**\n> {pred['expected']}")
+                    st.markdown(f"**Model Prediction:**\n> {pred['predicted']}")
+                    st.markdown(f"**Grade:** `{pred['grade']}`")
+
+        with tab_chart:
+            results_df = pd.DataFrame(predictions)
+
+            chart_c1, chart_c2 = st.columns(2)
+            with chart_c1:
+                grade_counts = results_df["is_correct"].value_counts().reset_index()
+                grade_counts.columns = ["is_correct", "count"]
+                grade_counts["label"] = grade_counts["is_correct"].map(
+                    {True: "Correct", False: "Incorrect"}
+                )
+                fig = px.pie(
+                    grade_counts,
+                    names="label",
+                    values="count",
+                    color="label",
+                    color_discrete_map={"Correct": "#10b981", "Incorrect": "#ef4444"},
+                    hole=0.4,
+                    title="Pass / Fail Distribution",
+                )
+                fig.update_layout(template=CHART_TEMPLATE, height=350)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with chart_c2:
+                results_df["status"] = results_df["is_correct"].map(
+                    {True: "Correct", False: "Incorrect"}
+                )
+                results_df["q_label"] = [f"Q{i+1}" for i in range(len(results_df))]
+                fig = px.bar(
+                    results_df,
+                    x="q_label",
+                    y=[1] * len(results_df),
+                    color="status",
+                    color_discrete_map={"Correct": "#10b981", "Incorrect": "#ef4444"},
+                    title="Per-Question Results",
+                )
+                fig.update_layout(
+                    template=CHART_TEMPLATE, height=350,
+                    xaxis_title="Question", yaxis_title="",
+                    yaxis={"visible": False},
+                    showlegend=True,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Results Table")
+            display = results_df[["question", "is_correct", "grade"]].copy()
+            display.columns = ["Question", "Correct", "Grade"]
+            display.insert(0, "#", range(1, len(display) + 1))
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+# ──────────────────────── OBSERVABILITY ────────────────────────
+
+elif view == "📡 Observability":
+    render_section_header("Observability Dashboard")
+
+    db_url = agent_settings.database_url
+    _obs_available = True
+    try:
+        from insightforge.observability.repository import (
+            get_latency_metrics,
+            get_quality_metrics,
+            get_steps_dataframe,
+            get_traces_dataframe,
+            get_usage_metrics,
+        )
+    except ImportError:
+        _obs_available = False
+
+    if not _obs_available or not db_url:
+        st.warning(
+            "Observability requires a DATABASE_URL and the observability "
+            "dependencies (sqlalchemy, psycopg2-binary). Run `alembic upgrade head` "
+            "after starting Postgres to create the trace tables."
+        )
+    else:
+        days = st.selectbox("Time window", [7, 14, 30, 90], index=2)
+
+        traces_df = get_traces_dataframe(db_url, days=days)
+        steps_df = get_steps_dataframe(db_url, days=days)
+
+        if traces_df.empty:
+            st.info(
+                "No traces recorded yet. Ask a question in the AI Assistant to "
+                "start collecting data."
+            )
+        else:
+            # ── Latency KPIs ──
+            latency = get_latency_metrics(db_url, days=days)
+            quality = get_quality_metrics(db_url, days=days)
+            usage = get_usage_metrics(db_url, days=days)
+
+            kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+            with kc1:
+                render_metric("Total Queries", f"{latency['count']:,}")
+            with kc2:
+                render_metric("Avg Latency", f"{latency['avg']:,.0f} ms")
+            with kc3:
+                render_metric("P95 Latency", f"{latency['p95']:,} ms")
+            with kc4:
+                q_score = quality.get("avg_quality")
+                render_metric(
+                    "Avg Quality",
+                    f"{q_score:.1f}/10" if q_score else "N/A",
+                )
+            with kc5:
+                render_metric("Error Rate", f"{quality['error_rate']:.1f}%")
+
+            st.markdown("")
+
+            tab_lat, tab_qual, tab_usage, tab_traces = st.tabs(
+                ["Latency", "Quality", "Usage", "Trace Log"],
+            )
+
+            # ── Latency tab ──
+            with tab_lat:
+                st.markdown("#### Latency by Pipeline Stage")
+                breakdown = latency.get("step_breakdown", [])
+                if breakdown:
+                    bd_df = pd.DataFrame(breakdown)
+                    fig = px.bar(
+                        bd_df, x="step", y="avg_ms",
+                        color_discrete_sequence=COLORS,
+                        text_auto=",.0f",
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Pipeline Stage",
+                        yaxis_title="Avg Latency (ms)",
+                    )
+                    fig.update_traces(textposition="outside")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("#### Latency Over Time")
+                if not traces_df.empty and "created_at" in traces_df.columns:
+                    fig = px.scatter(
+                        traces_df, x="created_at", y="total_latency_ms",
+                        color="status",
+                        color_discrete_sequence=COLORS,
+                        hover_data=["query"],
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Latency (ms)",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                if not steps_df.empty:
+                    st.markdown("#### Per-Step Latency Distribution")
+                    fig = px.box(
+                        steps_df, x="step_name", y="latency_ms",
+                        color="step_name", color_discrete_sequence=COLORS,
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=400,
+                        showlegend=False,
+                        xaxis_title="Step", yaxis_title="Latency (ms)",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # ── Quality tab ──
+            with tab_qual:
+                qc1, qc2, qc3 = st.columns(3)
+                with qc1:
+                    render_metric(
+                        "Avg Quality Score",
+                        f"{quality['avg_quality']:.1f}/10" if quality["avg_quality"] else "N/A",
+                    )
+                with qc2:
+                    render_metric("Fallback Rate", f"{quality['fallback_rate']:.1f}%")
+                with qc3:
+                    render_metric("Error Rate", f"{quality['error_rate']:.1f}%")
+
+                st.markdown("#### Quality Score Over Time")
+                scored = traces_df.dropna(subset=["quality_score"])
+                if not scored.empty:
+                    fig = px.scatter(
+                        scored, x="created_at", y="quality_score",
+                        color_discrete_sequence=["#10b981"],
+                        hover_data=["query"],
+                    )
+                    fig.add_hline(
+                        y=scored["quality_score"].mean(),
+                        line_dash="dash", line_color="#f59e0b",
+                        annotation_text=f"Avg: {scored['quality_score'].mean():.1f}",
+                    )
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Quality Score",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No quality scores recorded yet.")
+
+                st.markdown("#### Status Distribution")
+                status_counts = traces_df["status"].value_counts().reset_index()
+                status_counts.columns = ["status", "count"]
+                fig = px.pie(
+                    status_counts, names="status", values="count",
+                    color_discrete_sequence=COLORS, hole=0.4,
+                )
+                fig.update_layout(template=CHART_TEMPLATE, height=350)
+                st.plotly_chart(fig, use_container_width=True)
+
+            # ── Usage tab ──
+            with tab_usage:
+                uc1, uc2, uc3 = st.columns(3)
+                with uc1:
+                    render_metric(
+                        "Total Tokens In",
+                        f"{usage['total_tokens_input']:,}",
+                    )
+                with uc2:
+                    render_metric(
+                        "Total Tokens Out",
+                        f"{usage['total_tokens_output']:,}",
+                    )
+                with uc3:
+                    total_tok = usage["total_tokens_input"] + usage["total_tokens_output"]
+                    render_metric("Total Tokens", f"{total_tok:,}")
+
+                st.markdown("#### Token Usage Over Time")
+                if not traces_df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=traces_df["created_at"],
+                        y=traces_df["total_tokens_input"],
+                        mode="lines+markers", name="Input",
+                        line={"color": "#6366f1"},
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=traces_df["created_at"],
+                        y=traces_df["total_tokens_output"],
+                        mode="lines+markers", name="Output",
+                        line={"color": "#22d3ee"},
+                    ))
+                    fig.update_layout(
+                        template=CHART_TEMPLATE, height=350,
+                        xaxis_title="Time", yaxis_title="Tokens",
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                tool_usage = usage.get("tool_usage", {})
+                if tool_usage:
+                    st.markdown("#### Pipeline Stage Frequency")
+                    tu_df = pd.DataFrame(
+                        list(tool_usage.items()),
+                        columns=["stage", "count"],
+                    )
+                    fig = px.pie(
+                        tu_df, names="stage", values="count",
+                        color_discrete_sequence=COLORS, hole=0.4,
+                    )
+                    fig.update_layout(template=CHART_TEMPLATE, height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # ── Trace Log tab ──
+            with tab_traces:
+                st.markdown("#### Recent Traces")
+                display_df = traces_df[
+                    ["created_at", "query", "status", "total_latency_ms",
+                     "quality_score", "total_tokens_input", "total_tokens_output"]
+                ].copy()
+                display_df.columns = [
+                    "Time", "Query", "Status", "Latency (ms)",
+                    "Quality", "Tokens In", "Tokens Out",
+                ]
+                st.dataframe(
+                    display_df.sort_values("Time", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=500,
+                )
+
+    if agent_settings.langfuse_host:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(
+            f"[Open Langfuse Dashboard]({agent_settings.langfuse_host})"
+        )
 
 # ──────────────────────── FOOTER ────────────────────────
 

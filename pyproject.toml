@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insightforge"
+version = "0.1.0"
+description = "Agentic RAG BI Assistant"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.45.0",
+    "pandas>=2.2.0",
+    "plotly>=6.0.0",
+    "langchain>=0.3.0",
+    "langgraph>=0.2.0",
+    "langchain-ollama>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "pydantic-settings>=2.0.0",
+    "langfuse>=2.0.0",
+    "faiss-cpu>=1.9.0",
+    "python-dotenv>=1.1.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.14.0",
+    "psycopg2-binary>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "mypy>=1.0.0",
+    "pylint>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["insightforge*"]
+
+[tool.pylint.main]
+ignore-paths = ["alembic/"]
+
+[tool.pylint."messages control"]
+disable = [
+    "C0114",  # missing-module-docstring  (tests / small modules)
+    "C0115",  # missing-class-docstring   (SQLAlchemy models)
+    "C0116",  # missing-function-docstring (tests / trivial helpers)
+    "C0301",  # line-too-long (handled by formatter)
+    "C0302",  # too-many-lines
+    "C0413",  # wrong-import-position (Streamlit requires st.set_page_config first)
+    "C0415",  # import-outside-toplevel (intentional lazy imports)
+    "R0801",  # duplicate-code (test fixtures)
+    "R0903",  # too-few-public-methods (data classes / models)
+    "R0913",  # too-many-arguments
+    "R0914",  # too-many-local-variables
+    "W0603",  # global-statement (DB singletons)
+    "W0613",  # unused-argument (pytest fixtures / mocks)
+    "W0621",  # redefined-outer-name (pytest fixtures)
+    "W0718",  # broad-exception-caught (fallback error handling)
+]
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"

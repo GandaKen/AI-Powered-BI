@@ -1,0 +1,130 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: insightforge-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_MAX_LOADED_MODELS=3
+      - OLLAMA_KEEP_ALIVE=24h
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+        reservations:
+          memory: 6G
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: insightforge-ollama-init
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "ollama pull llama3.1:8b && ollama pull llama3.2:3b && ollama pull nomic-embed-text"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+
+  bifrost:
+    image: maximhq/bifrost:latest
+    container_name: insightforge-bifrost
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./bifrost/config.json:/app/data/config.json:ro
+    depends_on:
+      - ollama
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  redis:
+    image: redis:7-alpine
+    container_name: insightforge-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: insightforge-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-insightforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insightforge}
+      POSTGRES_DB: ${POSTGRES_DB:-insightforge}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-insightforge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: insightforge-app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - BIFROST_BASE_URL=http://bifrost:8080
+      - LLM_MODEL_LIGHT=llama3.2:3b
+      - LLM_MODEL_HEAVY=llama3.1:8b
+      - EMBEDDING_MODEL=nomic-embed-text
+      - RAG_TOP_K=5
+      - MAX_EVAL_RETRIES=1
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-insightforge}:${POSTGRES_PASSWORD:-insightforge}@postgres:5432/${POSTGRES_DB:-insightforge}
+    depends_on:
+      bifrost:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+volumes:
+  ollama_data:
+  redis_data:
+  postgres_data:

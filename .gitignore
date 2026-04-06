@@ -1,12 +1,18 @@
 # Virtual environment
 venv/
+.venv*/
 
 # Python artifacts
 __pycache__/
 *.pyc
+*.egg-info/
+.coverage
 
 # Environment variables
 .env
+
+# Internal docs
+docs/
 
 # Project-specific exclusions
 Capstone_Problem_Statement_Enabling_AI-Powered_Business_Intelligence_for_Organizations.docx
